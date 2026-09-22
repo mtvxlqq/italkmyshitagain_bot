@@ -14,6 +14,10 @@ from render import canvas_size, render_overlay_png
 MAX_OUTPUT_BYTES = 48 * 1024 * 1024
 MAX_VIDEO_BITRATE = 6_000_000
 AUDIO_BITRATE = 128_000
+# На хостинге мало памяти, а в контейнере ffmpeg видит все ядра хоста и заводит
+# буферы кадров на каждый поток — без ограничения его убивает OOM
+FFMPEG_THREADS = "2"
+X264_LOW_MEMORY = ["-x264-params", "rc-lookahead=10:sync-lookahead=0"]
 
 
 class VideoError(Exception):
@@ -44,6 +48,10 @@ async def _run(*args: str) -> str:
     stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
         tail = stderr.decode(errors="replace").strip().splitlines()[-3:]
+        if not tail:
+            # ничего не написал — скорее всего, процесс убит сигналом (-9 — нехватка памяти)
+            tail = [f"процесс завершился с кодом {proc.returncode}"
+                    + (" (не хватило памяти)" if proc.returncode == -9 else "")]
         raise VideoError(f"{Path(args[0]).name}: " + " | ".join(tail))
     return stdout.decode()
 
@@ -88,11 +96,12 @@ async def render_video(src: bytes, title: str | None) -> VideoResult:
         )
         args = [
             "ffmpeg", "-y", "-v", "error", "-i", str(src_path), "-i", str(overlay_path),
-            "-filter_complex", filters, "-map", "[out]",
+            "-filter_complex", filters, "-filter_complex_threads", "1", "-map", "[out]",
             "-c:v", _h264_encoder(), "-b:v", str(bitrate), "-maxrate", str(bitrate), "-bufsize", str(bitrate * 2),
+            "-threads", FFMPEG_THREADS,
         ]
         if _h264_encoder() == "libx264":
-            args += ["-preset", "veryfast"]
+            args += ["-preset", "veryfast", *X264_LOW_MEMORY]
         if has_audio:
             args += ["-map", "0:a:0", "-c:a", "aac", "-b:a", str(AUDIO_BITRATE)]
         args += ["-movflags", "+faststart", str(out_path)]
@@ -137,12 +146,12 @@ async def photo_to_music_video(image: bytes, audio: bytes, start: float, duratio
             "-map", "0:v", "-map", "1:a", "-t", f"{duration:.3f}",
             # размеры кратны 2 — требование yuv420p
             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
-            "-c:v", _h264_encoder(), "-b:v", "2M",
+            "-c:v", _h264_encoder(), "-b:v", "2M", "-threads", FFMPEG_THREADS,
             "-af", f"afade=t=in:d={MUSIC_FADE_IN},afade=t=out:st={duration - fade_out:.3f}:d={fade_out:.3f}",
             "-c:a", "aac", "-b:a", str(MUSIC_AUDIO_BITRATE),
         ]
         if _h264_encoder() == "libx264":
-            args += ["-preset", "veryfast", "-tune", "stillimage"]
+            args += ["-preset", "veryfast", "-tune", "stillimage", *X264_LOW_MEMORY]
         args += ["-movflags", "+faststart", str(out_path)]
         await _run(*args)
 
