@@ -1,0 +1,6 @@
+aiogram>=3.20
+pillow>=11
+# системно нужен ffmpeg (для видео)
+numpy>=2
+python-dotenv>=1
+tzdata
