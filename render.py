@@ -5,6 +5,7 @@ import json
 import re
 import unicodedata
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +16,11 @@ OVERLAY_SRC = ASSETS / "overlay.png"
 OVERLAY_CLEAN = ASSETS / "overlay_clean.png"
 OVERLAY_META = ASSETS / "overlay_clean.json"
 FONT_PATH = ASSETS / "fonts" / "Montserrat-ExtraBold.otf"
+# эмодзи Apple, 96×96, файлы названы кодом символа: 1f602.png = 😂
+EMOJI_DIR = ASSETS / "emoji"
+EMOJI = {chr(int(p.stem, 16)): p for p in EMOJI_DIR.glob("*.png")}
+EMOJI_SCALE = 1.25  # высота эмодзи относительно высоты заглавной буквы
+EMOJI_ADVANCE = 1.1  # ширина места под эмодзи относительно его размера — чтобы соседние не слипались
 
 SIDE = 1080  # короткая сторона результата
 SQUARE = (SIDE, SIDE)
@@ -205,15 +211,64 @@ def _base_overlay(size: tuple[int, int]) -> Image.Image:
 
 # ---------- заголовок ----------
 
+def _glyph(ch: str) -> bytes:
+    img = Image.new("L", (80, 80))
+    ImageDraw.Draw(img).text((10, 10), ch, font=_probe_font(), fill=255)
+    return img.tobytes()
+
+
+@cache
+def _probe_font() -> ImageFont.FreeTypeFont:
+    return ImageFont.truetype(str(FONT_PATH), 50)
+
+
+@cache
+def _in_font(ch: str) -> bool:
+    # символа нет в шрифте — рисуется так же, как заведомо отсутствующий (пустой прямоугольник);
+    # пустой глиф — невидимый служебный символ
+    glyph = _glyph(ch)
+    return glyph != _glyph("\U0010FFFD") and any(glyph)
+
+
+# keycap-эмодзи (1️⃣, #️⃣): цифра сама по себе есть в шрифте, убираем её вместе с рамкой
+_KEYCAP = re.compile("[0-9#*]\uFE0F?\u20E3")
+
+# селекторы вариантов (❤️ = ❤ + U+FE0F) — сами по себе невидимы
+_VARIATION_SELECTOR = re.compile("[\uFE00-\uFE0F\U000E0100-\U000E01EF]")
+
+
 def clean_title(title: str) -> str:
-    """Убирает эмодзи и прочие символы, которых нет в шрифте."""
+    """Убирает символы, которых нет в шрифте. Эмодзи из assets/emoji остаются."""
+    title = _KEYCAP.sub(" ", title)
     chars = []
     for ch in title:
-        cat = unicodedata.category(ch)
-        if cat == "So" or cat.startswith("C") or 0xFE00 <= ord(ch) <= 0xFE0F:
-            continue
-        chars.append(ch)
+        if ch.isspace():
+            chars.append(" ")
+        elif ch in EMOJI:
+            chars.append(ch)
+        elif not (unicodedata.category(ch).startswith("C") or _VARIATION_SELECTOR.match(ch)) and _in_font(ch):
+            chars.append(ch)
     return re.sub(r"\s+", " ", "".join(chars)).strip().upper()
+
+
+def _segments(line: str) -> list[str]:
+    """Строка по кускам: текст отдельно, каждое эмодзи отдельно."""
+    return [seg for seg in re.split(f"([{''.join(EMOJI)}])", line) if seg] if EMOJI else [line]
+
+
+def _emoji_size(font: ImageFont.FreeTypeFont) -> int:
+    cap = font.getbbox("Н")[3] - font.getbbox("Н")[1]
+    return round(cap * EMOJI_SCALE)
+
+
+def _line_width(line: str, font: ImageFont.FreeTypeFont) -> float:
+    size = _emoji_size(font)
+    return sum(size * EMOJI_ADVANCE if seg in EMOJI else font.getlength(seg) for seg in _segments(line))
+
+
+@cache
+def _emoji_image(ch: str, size: int) -> Image.Image:
+    return Image.open(EMOJI[ch]).convert("RGBA").resize((size, size), Image.LANCZOS)
 
 
 def _split_balanced(words: list[str], n: int, font: ImageFont.FreeTypeFont) -> list[str]:
@@ -225,7 +280,7 @@ def _split_balanced(words: list[str], n: int, font: ImageFont.FreeTypeFont) -> l
     for i in range(1, len(words) - n + 2):
         head = " ".join(words[:i])
         rest = _split_balanced(words[i:], n - 1, font)
-        width = max(font.getlength(line) for line in [head, *rest])
+        width = max(_line_width(line, font) for line in [head, *rest])
         if width < best_width:
             best, best_width = [head, *rest], width
     return best or [" ".join(words)]
@@ -238,7 +293,7 @@ def _layout_title(title: str, max_width: float, base_size: int) -> tuple[list[st
     for n in range(1, min(MAX_LINES, len(words)) + 1):
         probe = ImageFont.truetype(str(FONT_PATH), base_size)
         lines = _split_balanced(words, n, probe)
-        widest = max(probe.getlength(line) for line in lines)
+        widest = max(_line_width(line, probe) for line in lines)
         size = min(base_size, int(base_size * max_width / widest))
         # чем больше строк, тем меньше допустимый шрифт
         size = min(size, int(base_size * (1.0, 0.85, 0.7)[n - 1]))
@@ -279,8 +334,22 @@ def _draw_title(canvas: Image.Image, title: str, meta: OverlayMeta) -> None:
     for i, line in enumerate(lines):
         # якорь "ms" — по базовой линии, так высота строки не зависит от букв
         y = top + cap_h + i * (cap_h + line_gap)
-        sd.text((w / 2, y + shadow_dy), line, font=font, anchor="ms", fill=210, stroke_width=round(font.size * 0.04))
-        td.text((w / 2, y), line, font=font, anchor="ms", fill=(255, 255, 255, 255))
+        x = (w - _line_width(line, font)) / 2
+        for seg in _segments(line):
+            if seg in EMOJI:
+                # эмодзи — по центру высоты заглавных букв, с той же тенью, что и у текста
+                size = _emoji_size(font)
+                emoji = _emoji_image(seg, size)
+                pos = (round(x + size * (EMOJI_ADVANCE - 1) / 2), round(y - cap_h / 2 - size / 2))
+                alpha = emoji.getchannel("A").point(lambda a: a * 210 // 255)
+                shadow.paste(alpha, (pos[0], round(pos[1] + shadow_dy)), alpha)
+                text_layer.alpha_composite(emoji, pos)
+                x += size * EMOJI_ADVANCE
+            else:
+                sd.text((x, y + shadow_dy), seg, font=font, anchor="ls", fill=210,
+                        stroke_width=round(font.size * 0.04))
+                td.text((x, y), seg, font=font, anchor="ls", fill=(255, 255, 255, 255))
+                x += font.getlength(seg)
 
     shadow = shadow.filter(ImageFilter.GaussianBlur(font.size * 0.09))
     black = Image.new("RGBA", canvas.size, (0, 0, 0, 255))
