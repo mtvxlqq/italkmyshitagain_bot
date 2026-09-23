@@ -27,12 +27,14 @@ class Config:
     stats_time: time
     subscribers_threshold: int
     db_path: Path
+    overlay_dir: Path  # присланный в бота оверлей; лежит рядом с базой, чтобы пережить пересборку контейнера
 
 
 def load_config() -> Config:
     channel = _required("CHANNEL")
     username = channel.lstrip("@")
     hh, mm = os.getenv("STATS_TIME", "21:00").split(":")
+    db_path = Path(__file__).parent / os.getenv("DB_PATH", "bot.db")
     return Config(
         bot_token=_required("BOT_TOKEN"),
         admin_ids=frozenset(int(x) for x in _required("ADMIN_IDS").replace(" ", "").split(",") if x),
@@ -42,5 +44,6 @@ def load_config() -> Config:
         tz=ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow")),
         stats_time=time(int(hh), int(mm)),
         subscribers_threshold=int(os.getenv("SUBSCRIBERS_THRESHOLD", "100")),
-        db_path=Path(__file__).parent / os.getenv("DB_PATH", "bot.db"),
+        db_path=db_path,
+        overlay_dir=db_path.parent / "overlay",
     )

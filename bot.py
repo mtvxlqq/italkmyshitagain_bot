@@ -30,7 +30,10 @@ from aiogram.types import (
 from caption import build_caption, caption_too_long_for_message, parse_caption
 from config import Config, load_config
 from db import Database, Post
-from render import clean_title, prepare_overlay, render_post_image
+from render import (
+    OVERLAY_DEFAULT, PORTRAIT, SQUARE, WIDESCREEN, clean_title, current_overlay, install_overlay,
+    render_post_image, restore_overlay, sample_photo, use_overlay,
+)
 from video import VideoError, photo_to_music_video, render_video
 
 log = logging.getLogger("bot")
@@ -56,6 +59,7 @@ HELP = (
     "<b>Команды</b>\n"
     "/queue — отложенные посты\n"
     "/stats — статистика канала за сегодня\n"
+    "/overlay — сменить оверлей\n"
     "/cancel — отменить ввод времени"
 )
 
@@ -105,6 +109,14 @@ class ScheduleForm(StatesGroup):
 
 class MusicForm(StatesGroup):
     waiting_timecode = State()
+
+
+class OverlayForm(StatesGroup):
+    waiting_file = State()
+
+
+class OverlayCB(CallbackData, prefix="overlay"):
+    action: str  # restore
 
 
 MUSIC_DEFAULT_LEN = 30   # сек, если указано только начало
@@ -374,6 +386,96 @@ async def cmd_queue(message: Message, app: App) -> None:
         send = message.answer_video if first["type"] == "video" else message.answer_photo
         await send(first["file_id"], caption=text, reply_markup=scheduled_kb(post.id))
 
+
+# ---------- оверлей ----------
+
+IMAGE = F.photo | (F.document & F.document.mime_type.startswith("image/"))
+
+OVERLAY_PROMPT = (
+    "Пришли новый оверлей <b>файлом</b> (скрепка → Файл), чтобы Telegram не сжал его "
+    "и не убрал прозрачность. Лучше всего — квадратный PNG с прозрачным фоном. "
+    "Если на месте заголовка написан шаблонный текст (например, «ВАШ ТЕКСТ»), я сотру его "
+    "и буду ставить заголовок туда же.\n\n"
+    "Можно сразу прислать файл с подписью /overlay. Отмена — /cancel."
+)
+
+
+@admin.message(Command("overlay"), IMAGE)
+@admin.message(OverlayForm.waiting_file, IMAGE)
+async def on_overlay_file(message: Message, app: App, state: FSMContext) -> None:
+    await state.clear()
+    file = message.photo[-1] if message.photo else message.document
+    if (file.file_size or 0) > DOWNLOAD_LIMIT:
+        await message.answer("Файл больше 20 МБ — Telegram не даёт ботам скачивать такие.")
+        return
+
+    status = await message.answer("⏳ Ставлю новый оверлей…")
+    try:
+        data = (await app.bot.download(file.file_id)).read()
+        async with app.render_lock:
+            w, h = await asyncio.to_thread(install_overlay, data, app.cfg.overlay_dir)
+    except Exception as e:
+        log.exception("Не удалось поставить оверлей")
+        await message.answer(f"⚠️ Не получилось, оставил прежний оверлей: <code>{html.escape(str(e))}</code>")
+        return
+    finally:
+        await status.delete()
+
+    notes = ["✅ Новый оверлей стоит, все следующие посты будут с ним. "
+             "Уже готовые черновики и отложенные посты не меняются."]
+    if message.photo:
+        notes.append("⚠️ Картинка пришла как фото — Telegram её сжал и убрал прозрачность. "
+                     "Если выглядит не так, пришли её файлом.")
+    if abs(w / h - 1) > 0.02:
+        notes.append(f"⚠️ Оверлей {w}×{h}, а не квадратный — я растяну его до квадрата.")
+    await send_overlay_preview(app, message)
+    await message.answer(
+        "\n\n".join(notes),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text="↩️ Вернуть прежний", callback_data=OverlayCB(action="restore").pack(),
+        )]]),
+    )
+
+
+@admin.message(Command("overlay"))
+async def cmd_overlay(message: Message, state: FSMContext) -> None:
+    await state.set_state(OverlayForm.waiting_file)
+    src = current_overlay()
+    note = "Сейчас стоит стандартный оверлей." if src == OVERLAY_DEFAULT else "Сейчас стоит этот оверлей."
+    await message.answer_document(BufferedInputFile(src.read_bytes(), "overlay.png"), caption=note)
+    await message.answer(OVERLAY_PROMPT)
+
+
+@admin.message(OverlayForm.waiting_file)
+async def on_overlay_wrong(message: Message) -> None:
+    await message.answer("Жду картинку с оверлеем. Или /cancel.")
+
+
+@admin.callback_query(OverlayCB.filter(F.action == "restore"))
+async def cb_overlay_restore(query: CallbackQuery, app: App) -> None:
+    async with app.render_lock:
+        await asyncio.to_thread(restore_overlay, app.cfg.overlay_dir)
+    await query.answer("Вернул прежний оверлей")
+    await query.message.edit_text("↩️ Вернул прежний оверлей.")
+    await send_overlay_preview(app, query.message)
+
+
+async def send_overlay_preview(app: App, message: Message) -> None:
+    """Альбом: как оверлей ляжет на вертикальный, квадратный и широкий кадр."""
+    post = app.db.latest_draft()
+    first = post.media[0] if post else {}
+    title = post.title if post else "Так будет выглядеть заголовок"
+    # фото из последнего черновика нагляднее, чем пустой фон
+    photo = (await app.bot.download(first["src"])).read() if first.get("src") else sample_photo()
+    async with app.render_lock:
+        images = [await asyncio.to_thread(render_post_image, photo, title, size)
+                  for size in (PORTRAIT, SQUARE, WIDESCREEN)]
+    await send_media(app.bot, message.chat.id, [
+        {"type": "photo", "file": BufferedInputFile(img, f"{i}.jpg")} for i, img in enumerate(images)
+    ], "Превью: 3:4, 1:1 и 16:9")
+
+
+# ---------- посты ----------
 
 MEDIA = F.photo | F.video | (
     F.document & (F.document.mime_type.startswith("image/") | F.document.mime_type.startswith("video/"))
@@ -748,7 +850,8 @@ async def check_channel(app: App) -> None:
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = load_config()
-    prepare_overlay()
+    custom = cfg.overlay_dir / "overlay.png"
+    use_overlay(custom if custom.exists() else OVERLAY_DEFAULT)
 
     bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     app = App(bot=bot, cfg=cfg, db=Database(cfg.db_path))
@@ -764,6 +867,7 @@ async def main() -> None:
     await bot.set_my_commands([
         BotCommand(command="queue", description="Отложенные посты"),
         BotCommand(command="stats", description="Статистика за сегодня"),
+        BotCommand(command="overlay", description="Сменить оверлей"),
         BotCommand(command="help", description="Как сделать пост"),
         BotCommand(command="cancel", description="Отменить ввод"),
     ])

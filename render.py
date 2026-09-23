@@ -12,9 +12,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 ASSETS = Path(__file__).parent / "assets"
-OVERLAY_SRC = ASSETS / "overlay.png"
-OVERLAY_CLEAN = ASSETS / "overlay_clean.png"
-OVERLAY_META = ASSETS / "overlay_clean.json"
+OVERLAY_DEFAULT = ASSETS / "overlay.png"
 FONT_PATH = ASSETS / "fonts" / "Montserrat-ExtraBold.otf"
 # эмодзи Apple, 96×96, файлы названы кодом символа: 1f602.png = 😂
 EMOJI_DIR = ASSETS / "emoji"
@@ -96,10 +94,11 @@ def _remove_placeholder(rgb: np.ndarray, text_rows: tuple[int, int] | None) -> t
     return grad, grain
 
 
-def _find_placeholder_text(rgb: np.ndarray) -> tuple[int, int, int, int] | None:
-    lum = rgb.astype(np.float64).mean(axis=2)
+def _find_placeholder_text(rgba: np.ndarray) -> tuple[int, int, int, int] | None:
+    lum = rgba[..., :3].astype(np.float64).mean(axis=2)
     h = lum.shape[0]
-    mask = lum >= 235
+    # только непрозрачный белый: полупрозрачное белое зерно в прозрачных оверлеях — не текст
+    mask = (lum >= 235) & (rgba[..., 3] >= 200)
     mask[: h // 2] = False
     # отбрасываем одиночные белые пылинки — текст идёт сплошными строками
     rows = np.nonzero(mask.sum(axis=1) > 20)[0]
@@ -110,20 +109,32 @@ def _find_placeholder_text(rgb: np.ndarray) -> tuple[int, int, int, int] | None:
     return cols.min(), y0, cols.max(), y1
 
 
+# текущий исходник оверлея: из assets или присланный в бота (см. use_overlay)
+_overlay_src = OVERLAY_DEFAULT
+
+
+def _clean_paths(src: Path | None = None) -> tuple[Path, Path]:
+    """Готовый оверлей и его разметка лежат рядом с исходником: overlay.png → overlay_clean.png/.json."""
+    src = src or _overlay_src
+    base = src.with_name(src.stem + "_clean")
+    return base.with_suffix(".png"), base.with_suffix(".json")
+
+
 def prepare_overlay(force: bool = False) -> None:
     """Готовит оверлей с настоящей прозрачностью и без шаблонного текста."""
+    clean, meta_path = _clean_paths()
     fresh = (
-        OVERLAY_CLEAN.exists()
-        and OVERLAY_META.exists()
-        and OVERLAY_CLEAN.stat().st_mtime >= OVERLAY_SRC.stat().st_mtime
+        clean.exists()
+        and meta_path.exists()
+        and clean.stat().st_mtime >= _overlay_src.stat().st_mtime
     )
     if fresh and not force:
         return
 
-    src = Image.open(OVERLAY_SRC).convert("RGBA")
+    src = Image.open(_overlay_src).convert("RGBA")
     rgba = np.array(src)
     h, w = rgba.shape[:2]
-    text_box = _find_placeholder_text(rgba[..., :3])
+    text_box = _find_placeholder_text(rgba)
 
     if rgba[..., 3].min() < 250:
         # оверлей уже прозрачный — только затираем шаблонный текст
@@ -161,16 +172,71 @@ def prepare_overlay(force: bool = False) -> None:
     else:
         meta = OverlayMeta(0.81, 0.853, 0.76, 0.086)
 
-    Image.fromarray(out, "RGBA").save(OVERLAY_CLEAN)
-    OVERLAY_META.write_text(json.dumps(meta.__dict__, indent=2))
+    Image.fromarray(out, "RGBA").save(clean)
+    meta_path.write_text(json.dumps(meta.__dict__, indent=2))
 
 
 _overlay_cache: dict[tuple[int, int], Image.Image] = {}
 
 
+def use_overlay(src: Path, force: bool = False) -> None:
+    """Переключает оформление на другой исходник оверлея."""
+    global _overlay_src
+    _overlay_src = src
+    _overlay_cache.clear()
+    prepare_overlay(force)
+
+
+def current_overlay() -> Path:
+    return _overlay_src
+
+
+def install_overlay(data: bytes, folder: Path) -> tuple[int, int]:
+    """Ставит присланный оверлей вместо текущего, прежний сохраняет для отката.
+
+    Возвращает размер картинки. Если картинку не удалось разобрать, остаётся прежний оверлей.
+    """
+    img = Image.open(io.BytesIO(data))
+    img.load()
+    folder.mkdir(parents=True, exist_ok=True)
+    custom, prev, new = folder / "overlay.png", folder / "overlay_prev.png", folder / "overlay_new.png"
+    img.convert("RGBA").save(new)
+    # сначала готовим новый оверлей отдельно — если сломается, текущий не тронут
+    was = _overlay_src
+    try:
+        use_overlay(new, force=True)
+    except Exception:
+        for p in (new, *_clean_paths(new)):
+            p.unlink(missing_ok=True)
+        use_overlay(was)
+        raise
+    # своего оверлея не было — откат вернёт стандартный из assets
+    if custom.exists():
+        custom.replace(prev)
+    else:
+        prev.unlink(missing_ok=True)
+    # готовые файлы переименовываем вместе с исходником — второй раз не пересчитываем
+    for src, dst in zip((new, *_clean_paths(new)), (custom, *_clean_paths(custom))):
+        src.replace(dst)
+    use_overlay(custom)
+    return img.size
+
+
+def restore_overlay(folder: Path) -> None:
+    """Возвращает оверлей, который был до последней замены."""
+    custom, prev = folder / "overlay.png", folder / "overlay_prev.png"
+    if prev.exists():
+        prev.replace(custom)
+        use_overlay(custom, force=True)
+    else:
+        for p in (custom, *_clean_paths(custom)):
+            p.unlink(missing_ok=True)
+        use_overlay(OVERLAY_DEFAULT)
+
+
 def _load_meta() -> OverlayMeta:
     prepare_overlay()
-    return OverlayMeta(**json.loads(OVERLAY_META.read_text()))
+    return OverlayMeta(**json.loads(_clean_paths()[1].read_text()))
 
 
 def _widen(square: Image.Image, width: int) -> Image.Image:
@@ -201,7 +267,7 @@ def _base_overlay(size: tuple[int, int]) -> Image.Image:
     if size not in _overlay_cache:
         prepare_overlay()
         w, h = size
-        src = Image.open(OVERLAY_CLEAN).convert("RGBA")
+        src = Image.open(_clean_paths()[0]).convert("RGBA")
         if w <= h:
             _overlay_cache[size] = src.resize(size, Image.LANCZOS)
         else:
@@ -374,14 +440,25 @@ def render_overlay_png(size: tuple[int, int], title: str | None) -> bytes:
     return out.getvalue()
 
 
-def render_post_image(photo: bytes, title: str | None) -> bytes:
-    """JPEG: фото, обрезанное по центру в 1:1 или 3:4, с оверлеем и заголовком."""
+def render_post_image(photo: bytes, title: str | None, size: tuple[int, int] | None = None) -> bytes:
+    """JPEG: фото, обрезанное по центру под формат кадра (или заданный size), с оверлеем и заголовком."""
     img = ImageOps.exif_transpose(Image.open(io.BytesIO(photo))).convert("RGB")
-    size = canvas_size(*img.size)
+    size = size or canvas_size(*img.size)
     img = ImageOps.fit(img, size, Image.LANCZOS, centering=(0.5, 0.5))
     canvas = img.convert("RGBA")
     canvas.alpha_composite(render_overlay_layer(size, title))
 
     out = io.BytesIO()
     canvas.convert("RGB").save(out, "JPEG", quality=95, subsampling=0)
+    return out.getvalue()
+
+
+def sample_photo() -> bytes:
+    """Нейтральный фон для превью оверлея, когда нет подходящего фото."""
+    w, h = WIDESCREEN
+    t = np.linspace(0, 1, h)[:, None, None]
+    top, bottom = np.array([96, 112, 128]), np.array([168, 140, 112])
+    rgb = np.broadcast_to(top + (bottom - top) * t, (h, w, 3)).astype(np.uint8)
+    out = io.BytesIO()
+    Image.fromarray(rgb, "RGB").save(out, "JPEG", quality=90)
     return out.getvalue()

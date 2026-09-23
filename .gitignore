@@ -3,3 +3,4 @@
 bot.db
 __pycache__/
 assets/overlay_clean.*
+overlay/
