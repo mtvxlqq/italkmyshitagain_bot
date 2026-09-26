@@ -51,7 +51,8 @@ HELP = (
     "• всё остальное — текст поста, оставлю как есть (с форматированием).\n\n"
     "<b>Оформление</b> — кнопками под превью:\n"
     "• 📰 <b>Новость</b> — фото в рамке, заголовок снизу (по умолчанию);\n"
-    "• 📣 <b>Анонс</b> — фото слева, карточка «?», заголовок по центру;\n"
+    "• 📣 <b>Анонс</b> — фото артиста слева, справа карточка: второе фото альбома "
+    "(обложка) или «?», если его нет; заголовок по центру;\n"
     "• 💿 <b>Релизы</b> — «Эти релизы вышли сегодня» и до трёх обложек из альбома;\n"
     "• 💬 <b>Цитата</b> — затемнённое чёрно-белое фото и текст в «ёлочках» "
     "(включается само, если первая строка в кавычках или оформлена цитатой);\n"
@@ -471,11 +472,16 @@ def _cover_indexes(sources: list[dict]) -> list[int]:
     return [i for i, s in enumerate(sources) if s["kind"] == "photo"][:RELEASES_MAX]
 
 
+def _announce_cover(sources: list[dict]) -> dict | None:
+    """В анонсе второе фото — обложка: встаёт в карточку вместо «?»."""
+    return sources[1] if len(sources) > 1 and sources[1]["kind"] == "photo" else None
+
+
 async def render_media(app: App, chat_id: int, sources: list[dict], mode: str, card: Card) -> list[dict]:
     """Оформляет исходники для send_media.
 
     Первый файл — карточка шаблона, остальные — без оверлея. В релизах первые фото
-    (до трёх) склеиваются в одну карточку с обложками.
+    (до трёх) склеиваются в одну карточку с обложками, в анонсе второе фото — обложка в карточке.
     """
     async def download(file_id: str) -> bytes:
         return (await app.bot.download(file_id)).read()
@@ -496,6 +502,10 @@ async def render_media(app: App, chat_id: int, sources: list[dict], mode: str, c
             photos = [await download(sources[i]["file_id"]) for i in covers]
             add_photo(await asyncio.to_thread(render_card, mode, card, photos))
             rest = [(i, s) for i, s in rest if i not in covers]
+        cover = None
+        if mode == "announce" and (src := _announce_cover(sources)):
+            cover = await download(src["file_id"])
+            rest = [(i, s) for i, s in rest if i != 1]
 
         for n, (_, src) in enumerate(rest):
             await app.bot.send_chat_action(chat_id, "upload_video" if has_video else "upload_photo")
@@ -503,11 +513,12 @@ async def render_media(app: App, chat_id: int, sources: list[dict], mode: str, c
             templated = n == 0 and mode not in ("releases", "plain")
             if src["kind"] == "photo":
                 if templated:
-                    add_photo(await asyncio.to_thread(render_card, mode, card, [data]))
+                    photos = [data] + ([cover] if cover else [])
+                    add_photo(await asyncio.to_thread(render_card, mode, card, photos))
                 else:
                     add_photo(await asyncio.to_thread(render_plain, data))
             else:
-                layout = await asyncio.to_thread(card_layout, mode, card) if templated else None
+                layout = await asyncio.to_thread(card_layout, mode, card, cover) if templated else None
                 video = await render_video(data, layout)
                 items.append({
                     "type": "video", "file": BufferedInputFile(video.data, f"{len(items)}.mp4"),
@@ -664,7 +675,12 @@ async def _first_image(app: App, post: Post) -> bytes:
     if not style:  # пост до появления режимов — берём готовую картинку
         return (await app.bot.download(post.media[0]["file_id"])).read()
     mode, sources = style["mode"], style["sources"]
-    picked = [sources[i] for i in _cover_indexes(sources)] if mode == "releases" else sources[:1]
+    if mode == "releases":
+        picked = [sources[i] for i in _cover_indexes(sources)]
+    elif mode == "announce" and (cover := _announce_cover(sources)):
+        picked = [sources[0], cover]
+    else:
+        picked = sources[:1]
     photos = [(await app.bot.download(s["file_id"])).read() for s in picked]
     if mode == "plain":
         return await asyncio.to_thread(render_plain, photos[0])

@@ -425,7 +425,7 @@ def _news(card: Card) -> Layout:
     return Layout(size, rect, False, fg)
 
 
-def _announce(card: Card) -> Layout:
+def _announce(card: Card, cover: Image.Image | None = None) -> Layout:
     size = (1080, 1080)
     rect = (0, 60, 640, 740)
     # фото наполовину прозрачное и растворяется в фоне вправо и вниз
@@ -435,11 +435,20 @@ def _announce(card: Card) -> Layout:
     _header(fg, handle=False)
     draw = ImageDraw.Draw(fg)
 
-    # карточка с вопросом — обложку ещё не показали
-    draw.rounded_rectangle((560, 120, 999, 559), 12, fill=CARD, outline=RED, width=2)
-    q = _font(TITLE_FONT, 216)
-    box = q.getbbox("?")
-    draw.text((779.5 - (box[0] + box[2]) / 2, 339.5 - (box[1] + box[3]) / 2), "?", font=q, fill=WHITE)
+    # карточка справа: обложка, если её прислали, иначе вопрос — обложку ещё не показали
+    box = (560, 120, 1000, 560)
+    if cover:
+        side = box[2] - box[0]
+        img = ImageOps.fit(cover, (side, side), Image.LANCZOS).convert("RGBA")
+        mask = _rounded_mask(size, box, 12)[box[1]:box[3], box[0]:box[2]]
+        img.putalpha(Image.fromarray((mask * 255).round().astype(np.uint8)))
+        fg.alpha_composite(img, box[:2])
+        draw.rounded_rectangle((560, 120, 999, 559), 12, outline=RED, width=2)
+    else:
+        draw.rounded_rectangle((560, 120, 999, 559), 12, fill=CARD, outline=RED, width=2)
+        q = _font(TITLE_FONT, 216)
+        qb = q.getbbox("?")
+        draw.text((779.5 - (qb[0] + qb[2]) / 2, 339.5 - (qb[1] + qb[3]) / 2), "?", font=q, fill=WHITE)
 
     # всё снизу вверх: плашка с артистом, заголовок, «■ АНОНС»
     if card.author:
@@ -533,8 +542,13 @@ def _releases(covers: list[Image.Image]) -> Image.Image:
 _TEMPLATES = {"news": _news, "announce": _announce, "quote": _quote}
 
 
-def card_layout(mode: str, card: Card) -> Layout:
-    """Слой шаблона для фото или видео (кроме релизов — они собираются только из фото)."""
+def card_layout(mode: str, card: Card, cover: bytes | None = None) -> Layout:
+    """Слой шаблона для фото или видео (кроме релизов — они собираются только из фото).
+
+    cover — обложка для карточки анонса вместо «?».
+    """
+    if mode == "announce":
+        return _announce(card, _open(cover) if cover else None)
     return _TEMPLATES[mode](card)
 
 
@@ -547,10 +561,11 @@ def layout_png(layout: Layout) -> bytes:
 # ---------- публичное API ----------
 
 def render_card(mode: str, card: Card, photos: list[bytes]) -> bytes:
-    """JPEG карточки. Для релизов photos — обложки (до трёх), для остальных — одно фото."""
+    """JPEG карточки. Для релизов photos — обложки (до трёх), для анонса — фото и, если есть,
+    обложка, для остальных — одно фото."""
     if mode == "releases":
         return _jpeg(_releases([_open(p) for p in photos[:RELEASES_MAX]]))
-    layout = card_layout(mode, card)
+    layout = card_layout(mode, card, photos[1] if mode == "announce" and len(photos) > 1 else None)
     x, y, w, h = layout.rect
     img = ImageOps.fit(_open(photos[0]), (w, h), Image.LANCZOS)
     if layout.gray:
