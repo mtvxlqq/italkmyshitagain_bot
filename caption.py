@@ -1,6 +1,7 @@
 """Разбор подписи: первая строка — заголовок, остальное — текст поста с сохранением форматирования."""
 
 import html
+import re
 from dataclasses import dataclass
 
 from aiogram.types import MessageEntity
@@ -12,6 +13,9 @@ TEXT_LIMIT = 4096
 
 _SPACES = {c.encode("utf-16-le") for c in " \n\r\t"}
 _NEWLINE = "\n".encode("utf-16-le")
+_BLOCKQUOTES = {"blockquote", "expandable_blockquote"}
+# заголовок целиком в кавычках — тоже цитата
+_QUOTED = re.compile(r'^["«„“]([^"«»„“”]+)["»“”]$')
 
 
 @dataclass
@@ -19,6 +23,7 @@ class ParsedPost:
     title: str       # заголовок простым текстом — для картинки
     text_html: str   # весь текст поста: заголовок жирным первой строкой + тело как было
     text_len: int    # длина текста без разметки, в UTF-16
+    quote: bool = False  # заголовок — цитата: на картинке он будет в кавычках
 
 
 def _u16(text: str) -> bytes:
@@ -69,15 +74,25 @@ def parse_caption(text: str, entities: list[MessageEntity] | None) -> ParsedPost
         body_end -= 1
 
     title = _from_u16(raw[title_start * 2 : title_end * 2])
-    # жирный заголовка уже задаём сами — свой bold внутри не нужен
-    text_html = f"<b>{_slice_html(raw, entities, title_start, title_end, skip={'bold'})}</b>"
+    # цитата — первая строка оформлена цитатой Telegram или целиком взята в кавычки
+    in_blockquote = any(
+        e.type in _BLOCKQUOTES and e.offset <= title_start < e.offset + e.length for e in entities
+    )
+    if m := _QUOTED.match(title.strip()):
+        title = m[1].strip()
+    quote = in_blockquote or bool(m)
+    # жирный заголовка уже задаём сами — свой bold внутри не нужен;
+    # цитату Telegram ставим снаружи жирного, иначе теги окажутся вложены неправильно
+    text_html = f"<b>{_slice_html(raw, entities, title_start, title_end, skip={'bold', *_BLOCKQUOTES})}</b>"
+    if in_blockquote:
+        text_html = f"<blockquote>{text_html}</blockquote>"
     text_len = title_end - title_start
     if body_end > body_start:
         # сохраняем, сколько переносов строки было между заголовком и текстом
         sep = "\n" * max(1, units[nl:body_start].count(_NEWLINE))
         text_html += sep + _slice_html(raw, entities, body_start, body_end)
         text_len += len(sep) + body_end - body_start
-    return ParsedPost(title=title, text_html=text_html, text_len=text_len)
+    return ParsedPost(title=title, text_html=text_html, text_len=text_len, quote=quote)
 
 
 def _link_len(link_text: str) -> int:

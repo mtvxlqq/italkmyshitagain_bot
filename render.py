@@ -26,6 +26,9 @@ PORTRAIT = (SIDE, SIDE * 4 // 3)      # 3:4 — вертикальные кад�
 LANDSCAPE = (SIDE * 4 // 3, SIDE)     # 4:3 — умеренно горизонтальные
 WIDESCREEN = (SIDE * 16 // 9, SIDE)   # 16:9 — широкие
 MAX_LINES = 3
+# средняя яркость кадра (0–1), начиная с которой оверлей инвертируется: на светлом фото
+# белое зерно не видно, а тёмный градиент и чёрные пылинки выглядят как грязь
+LIGHT_THRESHOLD = 0.55
 
 
 @dataclass
@@ -176,7 +179,7 @@ def prepare_overlay(force: bool = False) -> None:
     meta_path.write_text(json.dumps(meta.__dict__, indent=2))
 
 
-_overlay_cache: dict[tuple[int, int], Image.Image] = {}
+_overlay_cache: dict[tuple[tuple[int, int], bool], Image.Image] = {}
 
 
 def use_overlay(src: Path, force: bool = False) -> None:
@@ -260,19 +263,32 @@ def _widen(square: Image.Image, width: int) -> Image.Image:
     return out
 
 
-def _base_overlay(size: tuple[int, int]) -> Image.Image:
+def _base_overlay(size: tuple[int, int], light: bool = False) -> Image.Image:
     """Оверлей нужного размера. Для 3:4 квадратный растягивается по высоте
     (полосы и градиент остаются на тех же местах относительно кадра),
-    для 4:3 и 16:9 — расширяется повтором середины."""
-    if size not in _overlay_cache:
-        prepare_overlay()
-        w, h = size
-        src = Image.open(_clean_paths()[0]).convert("RGBA")
-        if w <= h:
-            _overlay_cache[size] = src.resize(size, Image.LANCZOS)
+    для 4:3 и 16:9 — расширяется повтором середины.
+
+    light — для светлого кадра: цвета инвертированы (чёрное зерно, светлый градиент),
+    прозрачность та же."""
+    key = (size, light)
+    if key not in _overlay_cache:
+        if light:
+            img = _base_overlay(size).copy()
+            r, g, b, a = img.split()
+            img = Image.merge("RGBA", (*ImageOps.invert(Image.merge("RGB", (r, g, b))).split(), a))
         else:
-            _overlay_cache[size] = _widen(src.resize((h, h), Image.LANCZOS), w)
-    return _overlay_cache[size]
+            prepare_overlay()
+            w, h = size
+            src = Image.open(_clean_paths()[0]).convert("RGBA")
+            img = src.resize(size, Image.LANCZOS) if w <= h else _widen(src.resize((h, h), Image.LANCZOS), w)
+        _overlay_cache[key] = img
+    return _overlay_cache[key]
+
+
+def is_light(img: Image.Image) -> bool:
+    """Светлый ли кадр — по средней яркости уменьшенной копии."""
+    small = img.convert("L").resize((64, 64), Image.BILINEAR)
+    return np.asarray(small).mean() / 255 >= LIGHT_THRESHOLD
 
 
 # ---------- заголовок ----------
@@ -370,8 +386,10 @@ def _layout_title(title: str, max_width: float, base_size: int) -> tuple[list[st
     return lines, ImageFont.truetype(str(FONT_PATH), max(size, 12))
 
 
-def _draw_title(canvas: Image.Image, title: str, meta: OverlayMeta) -> None:
-    """Белый заголовок с мягкой тенью, на месте шаблонного текста."""
+def _draw_title(canvas: Image.Image, title: str, meta: OverlayMeta, light: bool = False) -> None:
+    """Белый заголовок с мягкой тенью, на месте шаблонного текста.
+
+    light — инвертированный оверлей: заголовок чёрный, тень светлая."""
     w, h = canvas.size
 
     probe = ImageFont.truetype(str(FONT_PATH), 100)
@@ -397,6 +415,7 @@ def _draw_title(canvas: Image.Image, title: str, meta: OverlayMeta) -> None:
     text_layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
     sd, td = ImageDraw.Draw(shadow), ImageDraw.Draw(text_layer)
     shadow_dy = font.size * 0.03
+    text_color = (0, 0, 0, 255) if light else (255, 255, 255, 255)
     for i, line in enumerate(lines):
         # якорь "ms" — по базовой линии, так высота строки не зависит от букв
         y = top + cap_h + i * (cap_h + line_gap)
@@ -414,39 +433,54 @@ def _draw_title(canvas: Image.Image, title: str, meta: OverlayMeta) -> None:
             else:
                 sd.text((x, y + shadow_dy), seg, font=font, anchor="ls", fill=210,
                         stroke_width=round(font.size * 0.04))
-                td.text((x, y), seg, font=font, anchor="ls", fill=(255, 255, 255, 255))
+                td.text((x, y), seg, font=font, anchor="ls", fill=text_color)
                 x += font.getlength(seg)
 
     shadow = shadow.filter(ImageFilter.GaussianBlur(font.size * 0.09))
-    black = Image.new("RGBA", canvas.size, (0, 0, 0, 255))
-    black.putalpha(shadow)
-    canvas.alpha_composite(black)
+    shade = Image.new("RGBA", canvas.size, (255, 255, 255, 255) if light else (0, 0, 0, 255))
+    shade.putalpha(shadow)
+    canvas.alpha_composite(shade)
     canvas.alpha_composite(text_layer)
 
 
 # ---------- публичное API ----------
 
-def render_overlay_layer(size: tuple[int, int], title: str | None) -> Image.Image:
-    """Прозрачный слой: оверлей + (если есть) заголовок. Используется и для фото, и для видео."""
-    layer = _base_overlay(size).copy()
+def render_overlay_layer(
+    size: tuple[int, int], title: str | None, quote: bool = False, light: bool = False,
+) -> Image.Image:
+    """Прозрачный слой: оверлей + (если есть) заголовок. Используется и для фото, и для видео.
+
+    quote — заголовок цитата: берём его в кавычки-ёлочки (они прилипают к крайним словам,
+    поэтому при переносе не остаются на строке одни). light — светлый кадр, см. _base_overlay.
+    """
+    layer = _base_overlay(size, light).copy()
     if title and (title := clean_title(title)):
-        _draw_title(layer, title, _load_meta())
+        if quote:
+            title = f"«{title}»"
+        _draw_title(layer, title, _load_meta(), light)
     return layer
 
 
-def render_overlay_png(size: tuple[int, int], title: str | None) -> bytes:
+def render_overlay_png(size: tuple[int, int], title: str | None, quote: bool = False, light: bool = False) -> bytes:
     out = io.BytesIO()
-    render_overlay_layer(size, title).save(out, "PNG")
+    render_overlay_layer(size, title, quote, light).save(out, "PNG")
     return out.getvalue()
 
 
-def render_post_image(photo: bytes, title: str | None, size: tuple[int, int] | None = None) -> bytes:
-    """JPEG: фото, обрезанное по центру под формат кадра (или заданный size), с оверлеем и заголовком."""
+def render_post_image(
+    photo: bytes, title: str | None, size: tuple[int, int] | None = None,
+    *, quote: bool = False, overlay: bool = True,
+) -> bytes:
+    """JPEG: фото, обрезанное по центру под формат кадра (или заданный size), с оверлеем и заголовком.
+
+    overlay=False — только обрезка, без оверлея и заголовка.
+    """
     img = ImageOps.exif_transpose(Image.open(io.BytesIO(photo))).convert("RGB")
     size = size or canvas_size(*img.size)
     img = ImageOps.fit(img, size, Image.LANCZOS, centering=(0.5, 0.5))
     canvas = img.convert("RGBA")
-    canvas.alpha_composite(render_overlay_layer(size, title))
+    if overlay:
+        canvas.alpha_composite(render_overlay_layer(size, title, quote, is_light(img)))
 
     out = io.BytesIO()
     canvas.convert("RGB").save(out, "JPEG", quality=95, subsampling=0)

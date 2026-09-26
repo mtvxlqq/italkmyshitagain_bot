@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
 
-from render import canvas_size, render_overlay_png
+from render import LIGHT_THRESHOLD, canvas_size, render_overlay_png
 
 # Бот может отправить файл до 50 МБ — оставляем запас на контейнер
 MAX_OUTPUT_BYTES = 48 * 1024 * 1024
@@ -75,7 +75,20 @@ async def _probe(path: Path) -> tuple[int, int, float, bool]:
     return w, h, duration, has_audio
 
 
-async def render_video(src: bytes, title: str | None) -> VideoResult:
+async def _is_light(path: Path, duration: float) -> bool:
+    """Светлое ли видео — по кадру из середины (как is_light для фото)."""
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-v", "error", "-ss", f"{duration / 2:.3f}", "-i", str(path), "-frames:v", "1",
+        "-vf", "scale=64:64", "-pix_fmt", "gray", "-f", "rawvideo", "-",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    frame, _ = await proc.communicate()
+    # кадр не достали — считаем тёмным, как было до инверсии
+    return bool(frame) and sum(frame) / len(frame) / 255 >= LIGHT_THRESHOLD
+
+
+async def render_video(src: bytes, title: str | None, *, quote: bool = False, overlay: bool = True) -> VideoResult:
+    """Кроп под формат кадра + оверлей с заголовком. overlay=False — только кроп и перекодирование."""
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         src_path, overlay_path, out_path = tmp / "src", tmp / "overlay.png", tmp / "out.mp4"
@@ -83,19 +96,22 @@ async def render_video(src: bytes, title: str | None) -> VideoResult:
 
         w, h, duration, has_audio = await _probe(src_path)
         cw, ch = canvas_size(w, h)
-        overlay_path.write_bytes(await asyncio.to_thread(render_overlay_png, (cw, ch), title))
+        if overlay:
+            light = await _is_light(src_path, duration)
+            overlay_path.write_bytes(await asyncio.to_thread(render_overlay_png, (cw, ch), title, quote, light))
 
         budget = MAX_OUTPUT_BYTES * 8 / max(duration, 1) - AUDIO_BITRATE
         bitrate = int(min(MAX_VIDEO_BITRATE, budget))
         if bitrate < 300_000:
             raise VideoError("Видео слишком длинное: в 50 МБ его не уместить в нормальном качестве")
 
-        filters = (
-            f"[0:v]scale={cw}:{ch}:force_original_aspect_ratio=increase,crop={cw}:{ch},setsar=1[v];"
-            f"[v][1:v]overlay=0:0,format=yuv420p[out]"
-        )
+        filters = f"[0:v]scale={cw}:{ch}:force_original_aspect_ratio=increase,crop={cw}:{ch},setsar=1"
+        if overlay:
+            filters += "[v];[v][1:v]overlay=0:0"
+        filters += ",format=yuv420p[out]"
+        inputs = ["-i", str(src_path)] + (["-i", str(overlay_path)] if overlay else [])
         args = [
-            "ffmpeg", "-y", "-v", "error", "-i", str(src_path), "-i", str(overlay_path),
+            "ffmpeg", "-y", "-v", "error", *inputs,
             "-filter_complex", filters, "-filter_complex_threads", "1", "-map", "[out]",
             "-c:v", _h264_encoder(), "-b:v", str(bitrate), "-maxrate", str(bitrate), "-bufsize", str(bitrate * 2),
             "-threads", FFMPEG_THREADS,
