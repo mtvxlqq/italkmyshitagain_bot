@@ -31,8 +31,8 @@ from caption import build_caption, caption_too_long_for_message, parse_caption
 from config import Config, load_config
 from db import Database, Post
 from render import (
-    OVERLAY_DEFAULT, PORTRAIT, SQUARE, WIDESCREEN, clean_title, current_overlay, install_overlay,
-    render_post_image, restore_overlay, sample_photo, use_overlay,
+    MODES, RELEASES_MAX, Card, card_layout, clean_title, looks_like_quote, make_card, render_card,
+    render_plain, set_brand,
 )
 from video import VideoError, photo_to_music_video, render_video
 
@@ -46,22 +46,28 @@ DOWNLOAD_LIMIT = 20 * 1024 * 1024  # больше Bot API скачать не д
 HELP = (
     "<b>Как сделать пост</b>\n"
     "Пришли фото или видео (или альбом до 10 штук) с подписью:\n"
-    "• <b>первая строка</b> — заголовок: попадёт на первое фото/видео и останется "
+    "• <b>первая строка</b> — заголовок: попадёт на карточку и останется "
     "первой строкой поста жирным;\n"
     "• всё остальное — текст поста, оставлю как есть (с форматированием).\n\n"
-    "На все файлы наложу оверлей, заголовок — только на первый. Если первая строка — цитата "
-    "(оформлена цитатой Telegram или взята в кавычки), на картинке заголовок будет в «ёлочках». "
-    "Формат подберу по кадру: "
-    "вертикальные — 3:4, почти квадратные — 1:1, горизонтальные — 4:3 или 16:9. В конец текста добавлю жирную ссылку на канал и покажу превью. "
+    "<b>Оформление</b> — кнопками под превью:\n"
+    "• 📰 <b>Новость</b> — фото в рамке, заголовок снизу (по умолчанию);\n"
+    "• 📣 <b>Анонс</b> — фото слева, карточка «?», заголовок по центру;\n"
+    "• 💿 <b>Релизы</b> — «Эти релизы вышли сегодня» и до трёх обложек из альбома;\n"
+    "• 💬 <b>Цитата</b> — затемнённое чёрно-белое фото и текст в «ёлочках» "
+    "(включается само, если первая строка в кавычках или оформлена цитатой);\n"
+    "• 🖼 <b>Без оверлея</b> — только обрезка под формат.\n\n"
+    "Слова заголовка, выделенные <i>курсивом</i> или <u>подчёркиванием</u>, будут красными. "
+    "Без выделения красным станет конец заголовка. В анонсе и цитате хвост "
+    "<code>— Имя</code> уйдёт в подпись под заголовком (артист / автор).\n\n"
+    "Карточка — только первый файл, остальные файлы альбома идут без оформления. "
+    "В конец текста добавлю жирную ссылку на канал. "
     "Дальше — опубликовать сразу или отложить.\n\n"
     "Видео — до 20 МБ (ограничение Telegram для ботов).\n\n"
     "<b>Музыка</b>\n"
-    "Пришли трек после поста — спрошу таймкод и сделаю из фото видео с этим отрывком "
-    "(в альбоме — из первого фото).\n\n"
+    "Пришли трек после поста — спрошу таймкод и сделаю из карточки видео с этим отрывком.\n\n"
     "<b>Команды</b>\n"
     "/queue — отложенные посты\n"
     "/stats — статистика канала за сегодня\n"
-    "/overlay — сменить, выключить или включить оверлей\n"
     "/cancel — отменить ввод времени"
 )
 
@@ -91,12 +97,6 @@ class App:
     def fmt(self, dt: datetime) -> str:
         return dt.astimezone(self.cfg.tz).strftime("%d.%m.%Y %H:%M")
 
-    def overlay_enabled(self) -> bool:
-        return self.db.get_setting("overlay_off") != "1"
-
-    def set_overlay_enabled(self, enabled: bool) -> None:
-        self.db.set_setting("overlay_off", "0" if enabled else "1")
-
     async def notify_admins(self, text: str, **kwargs) -> None:
         for admin_id in self.cfg.admin_ids:
             try:
@@ -106,7 +106,7 @@ class App:
 
 
 class PostCB(CallbackData, prefix="post"):
-    action: str  # publish | schedule | discard | unschedule | now | quick
+    action: str  # publish | schedule | discard | unschedule | now | quick | mode
     id: int
     arg: str = ""
 
@@ -117,14 +117,6 @@ class ScheduleForm(StatesGroup):
 
 class MusicForm(StatesGroup):
     waiting_timecode = State()
-
-
-class OverlayForm(StatesGroup):
-    waiting_file = State()
-
-
-class OverlayCB(CallbackData, prefix="overlay"):
-    action: str  # restore | on | off
 
 
 MUSIC_DEFAULT_LEN = 30   # сек, если указано только начало
@@ -207,8 +199,20 @@ def quick_time(code: str, now: datetime) -> datetime:
 
 # ---------- клавиатуры ----------
 
-def draft_kb(post_id: int) -> InlineKeyboardMarkup:
+def draft_kb(post_id: int, mode: str | None = None) -> InlineKeyboardMarkup:
+    """Кнопки черновика; mode — текущее оформление (None у постов до режимов — без переключателя)."""
+    modes = []
+    if mode:
+        buttons = [
+            InlineKeyboardButton(
+                text=("✓ " if key == mode else "") + label,
+                callback_data=PostCB(action="mode", id=post_id, arg=key).pack(),
+            )
+            for key, label in MODES.items()
+        ]
+        modes = [buttons[:3], buttons[3:]]
     return InlineKeyboardMarkup(inline_keyboard=[
+        *modes,
         [
             InlineKeyboardButton(text="🚀 Опубликовать", callback_data=PostCB(action="publish", id=post_id).pack()),
             InlineKeyboardButton(text="⏰ Отложить", callback_data=PostCB(action="schedule", id=post_id).pack()),
@@ -395,133 +399,19 @@ async def cmd_queue(message: Message, app: App) -> None:
         await send(first["file_id"], caption=text, reply_markup=scheduled_kb(post.id))
 
 
-# ---------- оверлей ----------
-
-IMAGE = F.photo | (F.document & F.document.mime_type.startswith("image/"))
-
-OVERLAY_PROMPT = (
-    "Пришли новый оверлей <b>файлом</b> (скрепка → Файл), чтобы Telegram не сжал его "
-    "и не убрал прозрачность. Лучше всего — квадратный PNG с прозрачным фоном. "
-    "Если на месте заголовка написан шаблонный текст (например, «ВАШ ТЕКСТ»), я сотру его "
-    "и буду ставить заголовок туда же.\n\n"
-    "Можно сразу прислать файл с подписью /overlay. Отмена — /cancel."
-)
-
-
-@admin.message(Command("overlay"), IMAGE)
-@admin.message(OverlayForm.waiting_file, IMAGE)
-async def on_overlay_file(message: Message, app: App, state: FSMContext) -> None:
-    await state.clear()
-    file = message.photo[-1] if message.photo else message.document
-    if (file.file_size or 0) > DOWNLOAD_LIMIT:
-        await message.answer("Файл больше 20 МБ — Telegram не даёт ботам скачивать такие.")
-        return
-
-    status = await message.answer("⏳ Ставлю новый оверлей…")
-    try:
-        data = (await app.bot.download(file.file_id)).read()
-        async with app.render_lock:
-            w, h = await asyncio.to_thread(install_overlay, data, app.cfg.overlay_dir)
-    except Exception as e:
-        log.exception("Не удалось поставить оверлей")
-        await message.answer(f"⚠️ Не получилось, оставил прежний оверлей: <code>{html.escape(str(e))}</code>")
-        return
-    finally:
-        await status.delete()
-
-    app.set_overlay_enabled(True)
-    notes = ["✅ Новый оверлей стоит (и включён), все следующие посты будут с ним. "
-             "Уже готовые черновики и отложенные посты не меняются."]
-    if message.photo:
-        notes.append("⚠️ Картинка пришла как фото — Telegram её сжал и убрал прозрачность. "
-                     "Если выглядит не так, пришли её файлом.")
-    if abs(w / h - 1) > 0.02:
-        notes.append(f"⚠️ Оверлей {w}×{h}, а не квадратный — я растяну его до квадрата.")
-    await send_overlay_preview(app, message)
-    await message.answer(
-        "\n\n".join(notes),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-            text="↩️ Вернуть прежний", callback_data=OverlayCB(action="restore").pack(),
-        )]]),
-    )
-
-
-def overlay_toggle_kb(enabled: bool) -> InlineKeyboardMarkup:
-    button = (
-        InlineKeyboardButton(text="🚫 Выключить оверлей", callback_data=OverlayCB(action="off").pack())
-        if enabled else
-        InlineKeyboardButton(text="✅ Включить оверлей", callback_data=OverlayCB(action="on").pack())
-    )
-    return InlineKeyboardMarkup(inline_keyboard=[[button]])
-
-
-def overlay_state_text(enabled: bool) -> str:
-    if enabled:
-        return "Оверлей <b>включён</b>: накладываю его и заголовок на все новые посты."
-    return ("Оверлей <b>выключен</b>: новые посты публикую без оверлея и заголовка на картинке — "
-            "фото и видео только обрезаю под формат кадра.")
-
-
-@admin.message(Command("overlay"))
-async def cmd_overlay(message: Message, app: App, state: FSMContext) -> None:
-    await state.set_state(OverlayForm.waiting_file)
-    src = current_overlay()
-    note = "Сейчас стоит стандартный оверлей." if src == OVERLAY_DEFAULT else "Сейчас стоит этот оверлей."
-    await message.answer_document(BufferedInputFile(src.read_bytes(), "overlay.png"), caption=note)
-    enabled = app.overlay_enabled()
-    await message.answer(overlay_state_text(enabled), reply_markup=overlay_toggle_kb(enabled))
-    await message.answer(OVERLAY_PROMPT)
-
-
-@admin.callback_query(OverlayCB.filter(F.action.in_({"on", "off"})))
-async def cb_overlay_toggle(query: CallbackQuery, callback_data: OverlayCB, app: App, state: FSMContext) -> None:
-    enabled = callback_data.action == "on"
-    app.set_overlay_enabled(enabled)
-    await state.clear()  # переключили — новый файл уже не ждём
-    await query.answer("Оверлей включён" if enabled else "Оверлей выключен")
-    await query.message.edit_text(
-        overlay_state_text(enabled) + "\n\nУже готовые черновики и отложенные посты не меняются.",
-        reply_markup=overlay_toggle_kb(enabled),
-    )
-
-
-@admin.message(OverlayForm.waiting_file)
-async def on_overlay_wrong(message: Message) -> None:
-    await message.answer("Жду картинку с оверлеем. Или /cancel.")
-
-
-@admin.callback_query(OverlayCB.filter(F.action == "restore"))
-async def cb_overlay_restore(query: CallbackQuery, app: App) -> None:
-    async with app.render_lock:
-        await asyncio.to_thread(restore_overlay, app.cfg.overlay_dir)
-    await query.answer("Вернул прежний оверлей")
-    await query.message.edit_text("↩️ Вернул прежний оверлей.")
-    await send_overlay_preview(app, query.message)
-
-
-async def send_overlay_preview(app: App, message: Message) -> None:
-    """Альбом: как оверлей ляжет на вертикальный, квадратный и широкий кадр."""
-    post = app.db.latest_draft()
-    first = post.media[0] if post else {}
-    title = post.title if post else "Так будет выглядеть заголовок"
-    # фото из последнего черновика нагляднее, чем пустой фон
-    photo = (await app.bot.download(first["src"])).read() if first.get("src") else sample_photo()
-    async with app.render_lock:
-        images = [await asyncio.to_thread(render_post_image, photo, title, size, quote=first.get("quote", False))
-                  for size in (PORTRAIT, SQUARE, WIDESCREEN)]
-    await send_media(app.bot, message.chat.id, [
-        {"type": "photo", "file": BufferedInputFile(img, f"{i}.jpg")} for i, img in enumerate(images)
-    ], "Превью: 3:4, 1:1 и 16:9")
-
-
 # ---------- посты ----------
 
 MEDIA = F.photo | F.video | (
     F.document & (F.document.mime_type.startswith("image/") | F.document.mime_type.startswith("video/"))
 )
+DEFAULT_MODE = "news"
 
 _albums: dict[str, list[Message]] = {}
 _album_tasks: dict[str, asyncio.Task] = {}
+
+
+class PostError(Exception):
+    """Ошибка оформления, которую можно показать как есть."""
 
 
 @admin.message(MEDIA)
@@ -566,8 +456,104 @@ def _stored(sent: Message, item: dict) -> dict:
     if item["type"] == "video":
         return {"type": "video", "file_id": sent.video.file_id,
                 **{k: item[k] for k in ("width", "height", "duration")}}
-    # src — исходник: из него перерисуем кадр, если к посту добавят музыку
-    return {"type": "photo", "file_id": sent.photo[-1].file_id, "src": item.get("src")}
+    return {"type": "photo", "file_id": sent.photo[-1].file_id}
+
+
+def post_style(post: Post) -> dict | None:
+    """Как оформлен черновик: режим, исходные файлы и выделение в заголовке.
+
+    Лежит в первом медиа; у постов, сделанных до появления режимов, — None.
+    """
+    return post.media[0].get("style")
+
+
+def _cover_indexes(sources: list[dict]) -> list[int]:
+    return [i for i, s in enumerate(sources) if s["kind"] == "photo"][:RELEASES_MAX]
+
+
+async def render_media(app: App, chat_id: int, sources: list[dict], mode: str, card: Card) -> list[dict]:
+    """Оформляет исходники для send_media.
+
+    Первый файл — карточка шаблона, остальные — без оверлея. В релизах первые фото
+    (до трёх) склеиваются в одну карточку с обложками.
+    """
+    async def download(file_id: str) -> bytes:
+        return (await app.bot.download(file_id)).read()
+
+    has_video = any(s["kind"] == "video" for s in sources)
+    items: list[dict] = []
+
+    def add_photo(image: bytes) -> None:
+        items.append({"type": "photo", "file": BufferedInputFile(image, f"{len(items)}.jpg")})
+
+    async with app.render_lock:
+        await app.bot.send_chat_action(chat_id, "upload_video" if has_video else "upload_photo")
+        rest = list(enumerate(sources))
+        if mode == "releases":
+            covers = _cover_indexes(sources)
+            if not covers:
+                raise PostError("Для релизов нужны фото обложек (до трёх).")
+            photos = [await download(sources[i]["file_id"]) for i in covers]
+            add_photo(await asyncio.to_thread(render_card, mode, card, photos))
+            rest = [(i, s) for i, s in rest if i not in covers]
+
+        for n, (_, src) in enumerate(rest):
+            await app.bot.send_chat_action(chat_id, "upload_video" if has_video else "upload_photo")
+            data = await download(src["file_id"])
+            templated = n == 0 and mode not in ("releases", "plain")
+            if src["kind"] == "photo":
+                if templated:
+                    add_photo(await asyncio.to_thread(render_card, mode, card, [data]))
+                else:
+                    add_photo(await asyncio.to_thread(render_plain, data))
+            else:
+                layout = await asyncio.to_thread(card_layout, mode, card) if templated else None
+                video = await render_video(data, layout)
+                items.append({
+                    "type": "video", "file": BufferedInputFile(video.data, f"{len(items)}.mp4"),
+                    "width": video.width, "height": video.height, "duration": video.duration,
+                })
+    return items
+
+
+async def make_preview(app: App, chat_id: int, sources: list[dict], mode: str, title: str,
+                       accent: list, caption: str, split: bool) -> list[dict] | None:
+    """Оформляет пост, присылает превью и возвращает медиа для черновика.
+
+    None — не получилось; причину уже написали в чат.
+    """
+    has_video = any(s["kind"] == "video" for s in sources)
+    status = None
+    if has_video or len(sources) > 1:
+        status = await app.bot.send_message(
+            chat_id, "⏳ Оформляю…" + (" Видео обрабатывается дольше фото." if has_video else "")
+        )
+    try:
+        rendered = await render_media(app, chat_id, sources, mode, make_card(title, accent, mode))
+    except (PostError, VideoError) as e:
+        await app.bot.send_message(chat_id, f"⚠️ {html.escape(str(e))}")
+        return None
+    finally:
+        if status:
+            await status.delete()
+
+    sent = await send_media(app.bot, chat_id, rendered, None if split else caption)
+    if split:
+        await app.bot.send_message(chat_id, caption, link_preview_options=NO_PREVIEW)
+    media = [_stored(m, item) for m, item in zip(sent, rendered)]
+    media[0]["style"] = {"mode": mode, "accent": accent, "sources": sources}
+    return media
+
+
+def draft_text(post_id: int, mode: str | None, split: bool, extra: str = "") -> str:
+    head = f"👆 Превью поста #{post_id}"
+    if mode:
+        head += f" — {MODES[mode]}{extra}. Другое оформление — кнопками ниже"
+    text = head + ". Что делаем?"
+    if split:
+        text += ("\n\n⚠️ Текст длиннее 1024 символов — в подпись не влезет, "
+                 "поэтому опубликую его отдельным сообщением сразу под постом.")
+    return text
 
 
 async def process_post(app: App, messages: list[Message]) -> None:
@@ -592,55 +578,47 @@ async def process_post(app: App, messages: list[Message]) -> None:
         )
         return
 
-    overlay = app.overlay_enabled()
-    has_video = any(kind == "video" for kind, _, _ in sources)
-    status = None
-    if has_video or len(sources) > 1:
-        status = await first.answer("⏳ Оформляю…" + (" Видео обрабатывается дольше фото." if has_video else ""))
-
-    rendered: list[dict] = []
-    try:
-        async with app.render_lock:
-            for i, (kind, file_id, _) in enumerate(sources):
-                await app.bot.send_chat_action(first.chat.id, "upload_video" if has_video else "upload_photo")
-                data = (await app.bot.download(file_id)).read()
-                title = parsed.title if i == 0 else None  # заголовок — только на первом
-                if kind == "photo":
-                    image = await asyncio.to_thread(
-                        render_post_image, data, title, quote=parsed.quote, overlay=overlay
-                    )
-                    rendered.append({"type": "photo", "file": BufferedInputFile(image, f"{i}.jpg"), "src": file_id})
-                else:
-                    video = await render_video(data, title, quote=parsed.quote, overlay=overlay)
-                    rendered.append({
-                        "type": "video", "file": BufferedInputFile(video.data, f"{i}.mp4"),
-                        "width": video.width, "height": video.height, "duration": video.duration,
-                    })
-    except VideoError as e:
-        await first.answer(f"⚠️ Не получилось обработать видео: {html.escape(str(e))}")
-        return
-    finally:
-        if status:
-            await status.delete()
-
+    mode = "quote" if parsed.blockquote or looks_like_quote(parsed.title) else DEFAULT_MODE
     caption, split = build_caption(parsed, app.cfg.channel_link_text, app.cfg.channel_url)
-    sent = await send_media(app.bot, first.chat.id, rendered, None if split else caption)
-    if split:
-        await first.answer(caption, link_preview_options=NO_PREVIEW)
-
-    media = [_stored(m, item) for m, item in zip(sent, rendered)]
-    # как оформлен пост — чтобы так же перерисовать кадр, если добавят музыку
-    media[0].update(quote=parsed.quote, overlay=overlay)
+    media = await make_preview(
+        app, first.chat.id, [{"kind": k, "file_id": f} for k, f, _ in sources],
+        mode, parsed.title, parsed.accent, caption, split,
+    )
+    if media is None:
+        return
     post_id = app.db.add_draft(media, caption, split, parsed.title)
-    note = ""
-    if not overlay:
-        note += "\n\n🚫 Оверлей выключен — включить можно в /overlay."
-    elif parsed.quote:
-        note += "\n\n💬 Первая строка — цитата, поставил заголовок в кавычки."
-    if split:
-        note += ("\n\n⚠️ Текст длиннее 1024 символов — в подпись не влезет, "
-                 "поэтому опубликую его отдельным сообщением сразу под постом.")
-    await first.answer(f"👆 Превью поста #{post_id}. Что делаем?{note}", reply_markup=draft_kb(post_id))
+    await first.answer(draft_text(post_id, mode, split), reply_markup=draft_kb(post_id, mode))
+
+
+@admin.callback_query(PostCB.filter(F.action == "mode"))
+async def cb_mode(query: CallbackQuery, callback_data: PostCB, app: App) -> None:
+    post = app.db.get_post(callback_data.id)
+    if not post or post.status != "draft":
+        await query.answer("Этот пост уже обработан.", show_alert=True)
+        return
+    style = post_style(post)
+    if not style:
+        await query.answer("Пост сделан до появления режимов — пришли его заново.", show_alert=True)
+        return
+    mode = callback_data.arg
+    if style["mode"] == mode:
+        await query.answer("Уже в этом оформлении")
+        return
+    await query.answer()
+    # убираем кнопки, чтобы не нажать дважды, пока рендерится
+    await query.message.edit_text(f"⏳ Пост #{post.id}: меняю оформление на {MODES[mode]}…")
+
+    media = await make_preview(
+        app, query.message.chat.id, style["sources"], mode, post.title, style["accent"],
+        post.caption_html, post.split_text,
+    )
+    if media is None:
+        await query.message.edit_text(draft_text(post.id, style["mode"], post.split_text),
+                                      reply_markup=draft_kb(post.id, style["mode"]))
+        return
+    app.db.update_media(post.id, media)
+    await query.message.edit_text(f"Пост #{post.id}: оформление сменилось на {MODES[mode]}, новое превью ниже.")
+    await query.message.answer(draft_text(post.id, mode, post.split_text), reply_markup=draft_kb(post.id, mode))
 
 
 AUDIO = F.audio | (F.document & F.document.mime_type.startswith("audio/"))
@@ -652,7 +630,12 @@ async def on_audio(message: Message, app: App, state: FSMContext) -> None:
     if not post:
         await message.answer("Сначала пришли пост с фото — музыку я наложу на его последний черновик.")
         return
-    if post.media[0]["type"] == "video" and not post.media[0].get("photo_src"):
+    style = post_style(post)
+    photo_first = (
+        (style["mode"] == "releases" or style["sources"][0]["kind"] == "photo") if style
+        else post.media[0]["type"] == "photo"
+    )
+    if not photo_first:
         await message.answer(f"Пост #{post.id} начинается с видео — музыку накладываю только на фото.")
         return
     audio = message.audio or message.document
@@ -675,6 +658,19 @@ async def on_audio(message: Message, app: App, state: FSMContext) -> None:
     )
 
 
+async def _first_image(app: App, post: Post) -> bytes:
+    """Первая картинка поста в полном качестве: перерисовываем из исходников, а не берём сжатое превью."""
+    style = post_style(post)
+    if not style:  # пост до появления режимов — берём готовую картинку
+        return (await app.bot.download(post.media[0]["file_id"])).read()
+    mode, sources = style["mode"], style["sources"]
+    picked = [sources[i] for i in _cover_indexes(sources)] if mode == "releases" else sources[:1]
+    photos = [(await app.bot.download(s["file_id"])).read() for s in picked]
+    if mode == "plain":
+        return await asyncio.to_thread(render_plain, photos[0])
+    return await asyncio.to_thread(render_card, mode, make_card(post.title, style["accent"], mode), photos)
+
+
 @admin.message(MusicForm.waiting_timecode, F.text)
 async def on_timecode(message: Message, app: App, state: FSMContext) -> None:
     tc = parse_timecode(message.text)
@@ -688,21 +684,11 @@ async def on_timecode(message: Message, app: App, state: FSMContext) -> None:
         await message.answer("Этот пост уже опубликован или удалён.")
         return
 
-    first = post.media[0]
     status = await message.answer("⏳ Делаю видео с музыкой…")
     try:
         async with app.render_lock:
             await app.bot.send_chat_action(message.chat.id, "upload_video")
-            if first["type"] == "photo":
-                photo_src, rendered = first.get("src"), not first.get("src")
-                photo_src = photo_src or first["file_id"]
-            else:  # музыку уже накладывали — берём исходное фото
-                photo_src, rendered = first["photo_src"], first.get("photo_rendered", False)
-            photo = (await app.bot.download(photo_src)).read()
-            quote, overlay = first.get("quote", False), first.get("overlay", True)
-            image = photo if rendered else await asyncio.to_thread(
-                render_post_image, photo, post.title, quote=quote, overlay=overlay
-            )
+            image = await _first_image(app, post)
             audio = (await app.bot.download(data["audio_id"])).read()
             video = await photo_to_music_video(image, audio, *tc)
     except VideoError as e:
@@ -720,15 +706,17 @@ async def on_timecode(message: Message, app: App, state: FSMContext) -> None:
     if post.split_text:
         await message.answer(post.caption_html, link_preview_options=NO_PREVIEW)
 
-    media = [{
-        "type": "video", "file_id": sent[0].video.file_id,
-        "width": video.width, "height": video.height, "duration": video.duration,
-        "photo_src": photo_src, "photo_rendered": rendered, "quote": quote, "overlay": overlay,
-    }] + post.media[1:]
-    app.db.update_media(post.id, media)
+    first = {"type": "video", "file_id": sent[0].video.file_id,
+             "width": video.width, "height": video.height, "duration": video.duration}
+    style = post_style(post)
+    if style:
+        first["style"] = style
+    app.db.update_media(post.id, [first] + post.media[1:])
+    mode = style["mode"] if style else None
     await message.answer(
-        f"👆 Превью поста #{post.id} с музыкой. Другой отрывок — пришли трек ещё раз. Что делаем?",
-        reply_markup=draft_kb(post.id),
+        draft_text(post.id, mode, post.split_text, extra=" с музыкой")
+        + "\n\nДругой отрывок — пришли трек ещё раз. Смена оформления уберёт музыку.",
+        reply_markup=draft_kb(post.id, mode),
     )
 
 
@@ -815,7 +803,9 @@ async def cb_unschedule(query: CallbackQuery, callback_data: PostCB, app: App) -
         return
     app.db.set_status(post.id, "draft")
     await query.answer("Снят с публикации")
-    await _replace_text(query, f"Пост #{post.id} снят с публикации — снова черновик.", draft_kb(post.id))
+    style = post_style(post)
+    await _replace_text(query, f"Пост #{post.id} снят с публикации — снова черновик.",
+                        draft_kb(post.id, style["mode"] if style else None))
 
 
 @admin.callback_query(PostCB.filter(F.action == "discard"))
@@ -889,6 +879,13 @@ async def check_channel(app: App) -> None:
         await app.notify_admins(f"⚠️ {html.escape(msg)}")
         return
 
+    # шапка карточек: имя и аватарка канала (если не выйдет — останутся из макета)
+    try:
+        avatar = (await app.bot.download(chat.photo.big_file_id)).read() if chat.photo else None
+        set_brand(chat.username, avatar)
+    except Exception:
+        log.exception("Не удалось взять аватарку канала")
+
     if member.status != ChatMemberStatus.ADMINISTRATOR or not getattr(member, "can_post_messages", False):
         msg = "Бот не админ канала или у него нет права публиковать сообщения."
         log.error(msg)
@@ -900,8 +897,6 @@ async def check_channel(app: App) -> None:
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = load_config()
-    custom = cfg.overlay_dir / "overlay.png"
-    use_overlay(custom if custom.exists() else OVERLAY_DEFAULT)
 
     bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     app = App(bot=bot, cfg=cfg, db=Database(cfg.db_path))
@@ -917,7 +912,6 @@ async def main() -> None:
     await bot.set_my_commands([
         BotCommand(command="queue", description="Отложенные посты"),
         BotCommand(command="stats", description="Статистика за сегодня"),
-        BotCommand(command="overlay", description="Сменить или выключить оверлей"),
         BotCommand(command="help", description="Как сделать пост"),
         BotCommand(command="cancel", description="Отменить ввод"),
     ])

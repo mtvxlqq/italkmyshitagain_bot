@@ -27,7 +27,6 @@ class Config:
     stats_time: time
     subscribers_threshold: int
     db_path: Path
-    overlay_dir: Path  # присланный в бота оверлей; лежит рядом с базой, чтобы пережить пересборку контейнера
 
 
 def load_config() -> Config:
@@ -45,5 +44,4 @@ def load_config() -> Config:
         stats_time=time(int(hh), int(mm)),
         subscribers_threshold=int(os.getenv("SUBSCRIBERS_THRESHOLD", "100")),
         db_path=db_path,
-        overlay_dir=db_path.parent / "overlay",
     )
