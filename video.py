@@ -78,8 +78,8 @@ async def _probe(path: Path) -> tuple[int, int, float, bool]:
 
 async def render_video(src: bytes, make_layout: Callable[[tuple[int, int]], Layout] | None) -> VideoResult:
     """Видео в шаблоне: кадр встаёт в окно layout.rect, сверху — слой шаблона.
-    make_layout строит слой по размеру кадра; None — без оформления: только кроп
-    под ближайший формат и перекодирование."""
+    make_layout строит слой по размеру кадра; None — без оформления: кадр целиком
+    (слишком высокий или широкий — с размытыми полями) и перекодирование."""
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         src_path, overlay_path, out_path = tmp / "src", tmp / "overlay.png", tmp / "out.mp4"
@@ -99,7 +99,17 @@ async def render_video(src: bytes, make_layout: Callable[[tuple[int, int]], Layo
         if bitrate < 300_000:
             raise VideoError("Видео слишком длинное: в 50 МБ его не уместить в нормальном качестве")
 
-        filters = f"[0:v]scale={rw}:{rh}:force_original_aspect_ratio=increase,crop={rw}:{rh},setsar=1"
+        if layout is None or layout.whole:
+            # кадр целиком, поля — размытая и затемнённая копия (размываем уменьшенную — так дешевле)
+            filters = (
+                f"[0:v]split[a][b];"
+                f"[a]scale={rw // 8}:{rh // 8}:force_original_aspect_ratio=increase,crop={rw // 8}:{rh // 8},"
+                f"gblur=sigma=4,eq=brightness=-0.25,scale={rw}:{rh}[bg];"
+                f"[b]scale={rw}:{rh}:force_original_aspect_ratio=decrease:force_divisible_by=2[fg];"
+                f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1"
+            )
+        else:
+            filters = f"[0:v]scale={rw}:{rh}:force_original_aspect_ratio=increase,crop={rw}:{rh},setsar=1"
         if layout:
             if layout.gray:
                 filters += ",hue=s=0"

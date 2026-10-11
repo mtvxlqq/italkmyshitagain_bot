@@ -14,7 +14,7 @@ from functools import cache
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
 ASSETS = Path(__file__).parent / "assets"
 FONTS = ASSETS / "fonts"
@@ -53,13 +53,10 @@ RELEASES_MAX = 3  # обложек на карточке релизов
 # ---------- режим без оверлея ----------
 
 SIDE = 1080  # короткая сторона результата
-# форматы кадра, ширина:высота — фото и видео встают в ближайший, обрезается только край
-FORMATS = [(9, 16), (3, 4), (4, 5), (1, 1), (4, 3), (16, 9)]
-
-
-def nearest_format(width: int, height: int) -> tuple[int, int]:
-    """Формат из FORMATS, ближайший к пропорциям кадра (по отношению сторон, а не разности)."""
-    return min(FORMATS, key=lambda f: abs(math.log(width / height * f[1] / f[0])))
+# Telegram в ленте обрезает по центру всё, что выше 4:5, — выше этого не делаем,
+# иначе не видно ни шапки, ни заголовка, пока не откроешь фото
+MAX_TALL = 5 / 4   # высота / ширина
+MAX_WIDE = 16 / 9  # ширина / высота
 
 
 def _even(x: float) -> int:
@@ -67,9 +64,10 @@ def _even(x: float) -> int:
 
 
 def canvas_size(width: int, height: int) -> tuple[int, int]:
-    """Размер результата без оверлея: ближайший формат, короткая сторона — SIDE."""
-    a, b = nearest_format(width, height)
-    return (SIDE, _even(SIDE * b / a)) if a < b else (_even(SIDE * a / b), SIDE)
+    """Размер результата без оверлея: пропорции кадра, но не выше 4:5 и не шире 16:9."""
+    if height > width:
+        return SIDE, _even(SIDE * min(height / width, MAX_TALL))
+    return _even(SIDE * min(width / height, MAX_WIDE)), SIDE
 
 
 def _open(photo: bytes) -> Image.Image:
@@ -82,10 +80,22 @@ def _jpeg(img: Image.Image) -> bytes:
     return out.getvalue()
 
 
+def _whole(img: Image.Image, size: tuple[int, int]) -> Image.Image:
+    """Фото целиком в рамке size; пустые поля — размытая и затемнённая копия кадра."""
+    if abs(math.log(img.width / img.height * size[1] / size[0])) < 0.02:
+        return ImageOps.fit(img, size, Image.LANCZOS)  # разница в пару пикселей — полей не нужно
+    small = ImageOps.fit(img, (max(size[0] // 8, 1), max(size[1] // 8, 1)), Image.LANCZOS)
+    bg = small.filter(ImageFilter.GaussianBlur(4)).resize(size, Image.LANCZOS)
+    bg = ImageEnhance.Brightness(bg).enhance(0.55)
+    fg = ImageOps.contain(img, size, Image.LANCZOS)
+    bg.paste(fg, ((size[0] - fg.width) // 2, (size[1] - fg.height) // 2))
+    return bg
+
+
 def render_plain(photo: bytes) -> bytes:
-    """JPEG без оформления: фото, обрезанное по центру под ближайший формат кадра."""
+    """JPEG без оформления: фото целиком, слишком высокое или широкое — с размытыми полями."""
     img = _open(photo)
-    return _jpeg(ImageOps.fit(img, canvas_size(*img.size), Image.LANCZOS))
+    return _jpeg(_whole(img, canvas_size(*img.size)))
 
 
 # ---------- канал в шапке ----------
@@ -402,15 +412,17 @@ class Layout:
     rect: tuple[int, int, int, int]  # x, y, w, h — куда встаёт фото или видео
     gray: bool                       # фото под слоем чёрно-белое
     fg: Image.Image                  # слой шаблона поверх фото
+    whole: bool = False              # фото не обрезается: поля вокруг — размытая копия кадра
 
 
 # ---------- шаблоны ----------
 
 def _news(card: Card, frame: tuple[int, int]) -> Layout:
-    # окно под фото — во всю ширину, высота по формату кадра; текст под ним съезжает вместе с ним
-    a, b = nearest_format(*frame)
-    x, y, w, h = rect = (40, 132, 1000, _even(1000 * b / a))
-    bottom = y + h  # в макете (окно 1000×880) низ фото — 1012
+    # окно под фото — во всю ширину, высота по кадру: от 16:9 до 1000×880 из макета, чтобы
+    # карточка не вышла выше 4:5; текст под окном съезжает вместе с его низом
+    fw, fh = frame
+    x, y, w, h = rect = (40, 132, 1000, _even(min(max(1000 * fh / fw, 1000 / MAX_WIDE), 880)))
+    bottom = y + h  # в макете низ фото — 1012
     size = (1080, bottom + 338)
     fg = _layer(_background(size), 1 - _rounded_mask(size, (x, y, x + w, y + h), 4))
     _header(fg)
@@ -428,7 +440,7 @@ def _news(card: Card, frame: tuple[int, int]) -> Layout:
     below = first + pitch * (len(lines) - 1) + 52
     end = _draw_tracked(draw, 41, below, "ЧИТАЙ В ПОСТЕ", _label_font(400, 24), 1.7, GRAY)
     _arrow(draw, end + 17, below - 5, GRAY)
-    return Layout(size, rect, False, fg)
+    return Layout(size, rect, False, fg, whole=True)
 
 
 def _announce(card: Card, cover: Image.Image | None = None) -> Layout:
@@ -574,7 +586,7 @@ def render_card(mode: str, card: Card, photos: list[bytes]) -> bytes:
     photo = _open(photos[0])
     layout = card_layout(mode, card, photo.size, photos[1] if mode == "announce" and len(photos) > 1 else None)
     x, y, w, h = layout.rect
-    img = ImageOps.fit(photo, (w, h), Image.LANCZOS)
+    img = _whole(photo, (w, h)) if layout.whole else ImageOps.fit(photo, (w, h), Image.LANCZOS)
     if layout.gray:
         img = ImageOps.grayscale(img).convert("RGB")
     canvas = Image.new("RGBA", layout.size, (0, 0, 0, 255))
