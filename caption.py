@@ -104,10 +104,14 @@ def _link_len(link_text: str) -> int:
     return 2 + len(_u16(link_text)) // 2  # "\n\n" + ссылка
 
 
+def channel_link(link_text: str, link_url: str) -> str:
+    """Жирная ссылка на канал — ей заканчивается каждый пост."""
+    return f'<b><a href="{html.escape(link_url, quote=True)}">{html.escape(link_text)}</a></b>'
+
+
 def build_caption(post: ParsedPost, link_text: str, link_url: str) -> tuple[str, bool]:
     """Возвращает HTML подписи и флаг «текст не влезает в подпись к фото»."""
-    link = f'<b><a href="{html.escape(link_url, quote=True)}">{html.escape(link_text)}</a></b>'
-    caption = f"{post.text_html}\n\n{link}"
+    caption = f"{post.text_html}\n\n{channel_link(link_text, link_url)}"
     return caption, post.text_len + _link_len(link_text) > CAPTION_LIMIT
 
 

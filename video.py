@@ -4,6 +4,7 @@ import asyncio
 import json
 import subprocess
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
@@ -75,15 +76,17 @@ async def _probe(path: Path) -> tuple[int, int, float, bool]:
     return w, h, duration, has_audio
 
 
-async def render_video(src: bytes, layout: Layout | None) -> VideoResult:
+async def render_video(src: bytes, make_layout: Callable[[tuple[int, int]], Layout] | None) -> VideoResult:
     """Видео в шаблоне: кадр встаёт в окно layout.rect, сверху — слой шаблона.
-    layout=None — без оформления: только кроп под ближайший формат и перекодирование."""
+    make_layout строит слой по размеру кадра; None — без оформления: только кроп
+    под ближайший формат и перекодирование."""
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         src_path, overlay_path, out_path = tmp / "src", tmp / "overlay.png", tmp / "out.mp4"
         src_path.write_bytes(src)
 
         w, h, duration, has_audio = await _probe(src_path)
+        layout = await asyncio.to_thread(make_layout, (w, h)) if make_layout else None
         if layout:
             (cw, ch), (x, y, rw, rh) = layout.size, layout.rect
             overlay_path.write_bytes(await asyncio.to_thread(layout_png, layout))

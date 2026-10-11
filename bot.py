@@ -6,6 +6,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from functools import partial
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -25,14 +26,18 @@ from aiogram.types import (
     InputMediaVideo,
     LinkPreviewOptions,
     Message,
+    MessageOriginChannel,
+    MessageOriginChat,
+    MessageOriginHiddenUser,
+    MessageOriginUser,
 )
 
-from caption import build_caption, caption_too_long_for_message, parse_caption
+from caption import build_caption, caption_too_long_for_message, channel_link, parse_caption
 from config import Config, load_config
 from db import Database, Post
 from render import (
-    MODES, RELEASES_MAX, Card, card_layout, clean_title, looks_like_quote, make_card, render_card,
-    render_plain, set_brand,
+    CHAT_PAGES_MAX, MODES, RELEASES_MAX, Card, ChatMessage, card_layout, clean_title, looks_like_quote,
+    make_card, render_card, render_chat, render_plain, set_brand,
 )
 from video import VideoError, photo_to_music_video, render_video
 
@@ -41,6 +46,7 @@ log = logging.getLogger("bot")
 SCHEDULER_INTERVAL = 15  # секунд между проверками очереди
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 ALBUM_WAIT = 1.5  # сек: части альбома приходят отдельными сообщениями, ждём все
+FORWARD_WAIT = 2.0  # сек: пересланные разом сообщения тоже приходят по одному
 DOWNLOAD_LIMIT = 20 * 1024 * 1024  # больше Bot API скачать не даёт
 
 HELP = (
@@ -66,6 +72,11 @@ HELP = (
     "Видео — до 20 МБ (ограничение Telegram для ботов).\n\n"
     "<b>Музыка</b>\n"
     "Пришли трек после поста — спрошу таймкод и сделаю из карточки видео с этим отрывком.\n\n"
+    "<b>Переписка</b>\n"
+    "Перешли мне сообщения из чата — соберу их в картинку «Переписка»: ник, текст и время "
+    "каждого сообщения. Длинная переписка займёт несколько картинок (до 10). "
+    "Фото и видео из личных чатов тоже попадут в переписку — подписью «Фото»/«Видео», "
+    "а пересланные из каналов останутся обычным постом.\n\n"
     "<b>Команды</b>\n"
     "/queue — отложенные посты\n"
     "/stats — статистика канала за сегодня\n"
@@ -400,11 +411,102 @@ async def cmd_queue(message: Message, app: App) -> None:
         await send(first["file_id"], caption=text, reply_markup=scheduled_kb(post.id))
 
 
-# ---------- посты ----------
+# ---------- переписка ----------
 
+# фото/видео — пост, трек — музыка к посту
 MEDIA = F.photo | F.video | (
     F.document & (F.document.mime_type.startswith("image/") | F.document.mime_type.startswith("video/"))
 )
+AUDIO = F.audio | (F.document & F.document.mime_type.startswith("audio/"))
+# пересланное — в переписку, кроме треков и фото/видео из каналов: из них, как раньше, пост
+FORWARD = F.forward_origin & ~AUDIO & (~MEDIA | F.forward_origin.type.in_({"user", "hidden_user"}))
+# чем заменить вложение в пузыре (порядок важен: у GIF есть и document)
+_ATTACHMENTS = [
+    ("photo", "Фото"), ("video", "Видео"), ("animation", "GIF"), ("video_note", "Видеосообщение"),
+    ("voice", "Голосовое сообщение"), ("sticker", "Стикер"), ("document", "Файл"),
+    ("poll", "Опрос"), ("location", "Геопозиция"), ("contact", "Контакт"),
+]
+
+_forwards: dict[int, list[Message]] = {}
+_forward_tasks: dict[int, asyncio.Task] = {}
+
+
+@admin.message(FORWARD)
+async def on_forward(message: Message, app: App, state: FSMContext) -> None:
+    await state.clear()
+    chat_id = message.chat.id
+    _forwards.setdefault(chat_id, []).append(message)
+    if task := _forward_tasks.get(chat_id):
+        task.cancel()
+    _forward_tasks[chat_id] = asyncio.create_task(_finish_forwards(app, chat_id))
+
+
+async def _finish_forwards(app: App, chat_id: int) -> None:
+    await asyncio.sleep(FORWARD_WAIT)
+    _forward_tasks.pop(chat_id, None)
+    messages = sorted(_forwards.pop(chat_id, []), key=lambda m: m.message_id)
+    try:
+        await process_chat(app, messages)
+    except Exception as e:
+        log.exception("Ошибка оформления переписки")
+        await messages[0].answer(f"⚠️ Не получилось оформить переписку: <code>{html.escape(str(e))}</code>")
+
+
+def _sender(message: Message) -> tuple[str, str]:
+    """Имя автора пересланного сообщения и ключ, по которому у собеседника один цвет."""
+    origin = message.forward_origin
+    if isinstance(origin, MessageOriginUser):
+        return origin.sender_user.full_name, f"user{origin.sender_user.id}"
+    if isinstance(origin, MessageOriginHiddenUser):
+        return origin.sender_user_name, f"hidden{origin.sender_user_name}"
+    if isinstance(origin, MessageOriginChat):
+        return origin.sender_chat.title or "", f"chat{origin.sender_chat.id}"
+    if isinstance(origin, MessageOriginChannel):
+        return origin.chat.title or "", f"chat{origin.chat.id}"
+    return "", "unknown"
+
+
+def _chat_message(app: App, message: Message) -> ChatMessage:
+    name, key = _sender(message)
+    note = next((label for attr, label in _ATTACHMENTS if getattr(message, attr, None)), "")
+    return ChatMessage(
+        sender=name, key=key,
+        time=message.forward_origin.date.astimezone(app.cfg.tz).strftime("%H:%M"),
+        text=message.text or message.caption or "", note=note,
+    )
+
+
+async def process_chat(app: App, messages: list[Message]) -> None:
+    first = messages[0]
+    chat = [_chat_message(app, m) for m in messages]
+    status = await first.answer("⏳ Оформляю переписку…") if len(messages) > 5 else None
+    try:
+        pages = await asyncio.to_thread(render_chat, chat)
+    finally:
+        if status:
+            await status.delete()
+    if not pages:
+        await first.answer("В пересланных сообщениях нечего нарисовать: в них только символы, которых нет в шрифте.")
+        return
+    if len(pages) > CHAT_PAGES_MAX:
+        await first.answer(
+            f"Переписка вышла на {len(pages)} картинок, а в пост влезает {CHAT_PAGES_MAX}. "
+            "Перешли меньше сообщений."
+        )
+        return
+
+    caption = channel_link(app.cfg.channel_link_text, app.cfg.channel_url)
+    items = [{"type": "photo", "file": BufferedInputFile(page, f"{i}.jpg")} for i, page in enumerate(pages)]
+    sent = await send_media(app.bot, first.chat.id, items, caption)
+    media = [_stored(m, item) for m, item in zip(sent, items)]
+    names = list(dict.fromkeys(m.sender for m in chat if m.sender))
+    title = "Переписка" + (f": {', '.join(names[:3])}" if names else "")
+    post_id = app.db.add_draft(media, caption, False, title)
+    await first.answer(draft_text(post_id, None, False), reply_markup=draft_kb(post_id))
+
+
+# ---------- посты ----------
+
 DEFAULT_MODE = "news"
 
 _albums: dict[str, list[Message]] = {}
@@ -518,8 +620,7 @@ async def render_media(app: App, chat_id: int, sources: list[dict], mode: str, c
                 else:
                     add_photo(await asyncio.to_thread(render_plain, data))
             else:
-                layout = await asyncio.to_thread(card_layout, mode, card, cover) if templated else None
-                video = await render_video(data, layout)
+                video = await render_video(data, partial(card_layout, mode, card, cover=cover) if templated else None)
                 items.append({
                     "type": "video", "file": BufferedInputFile(video.data, f"{len(items)}.mp4"),
                     "width": video.width, "height": video.height, "duration": video.duration,
@@ -630,9 +731,6 @@ async def cb_mode(query: CallbackQuery, callback_data: PostCB, app: App) -> None
     app.db.update_media(post.id, media)
     await query.message.edit_text(f"Пост #{post.id}: оформление сменилось на {MODES[mode]}, новое превью ниже.")
     await query.message.answer(draft_text(post.id, mode, post.split_text), reply_markup=draft_kb(post.id, mode))
-
-
-AUDIO = F.audio | (F.document & F.document.mime_type.startswith("audio/"))
 
 
 @admin.message(AUDIO)
