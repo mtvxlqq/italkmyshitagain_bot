@@ -92,10 +92,17 @@ def _whole(img: Image.Image, size: tuple[int, int]) -> Image.Image:
     return bg
 
 
-def render_plain(photo: bytes) -> bytes:
-    """JPEG без оформления: фото целиком, слишком высокое или широкое — с размытыми полями."""
+def render_plain(photo: bytes, size: tuple[int, int] | None = None) -> bytes:
+    """JPEG без оформления: фото целиком, слишком высокое или широкое — с размытыми полями.
+
+    size — точный размер результата (слайды карусели равняются на первый); по умолчанию — по кадру.
+    """
     img = _open(photo)
-    return _jpeg(_whole(img, canvas_size(*img.size)))
+    return _jpeg(_whole(img, size or canvas_size(*img.size)))
+
+
+def image_size(data: bytes) -> tuple[int, int]:
+    return Image.open(io.BytesIO(data)).size
 
 
 # ---------- канал в шапке ----------

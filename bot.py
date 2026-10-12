@@ -37,7 +37,7 @@ from config import Config, load_config
 from db import Database, Post
 from render import (
     CHAT_PAGES_MAX, MODES, RELEASES_MAX, Card, ChatMessage, card_layout, clean_title, looks_like_quote,
-    make_card, render_card, render_chat, render_plain, set_brand,
+    image_size, make_card, render_card, render_chat, render_plain, set_brand,
 )
 from video import VideoError, photo_to_music_video, render_video
 
@@ -63,6 +63,9 @@ HELP = (
     "• 💬 <b>Цитата</b> — затемнённое чёрно-белое фото и текст в «ёлочках» "
     "(включается само, если первая строка в кавычках или оформлена цитатой);\n"
     "• 🖼 <b>Без оверлея</b> — только обрезка под формат.\n\n"
+    "<b>Карусель</b> — для альбома из нескольких файлов: кнопка 🎠 под превью. Оверлей будет "
+    "только на первом слайде, а все остальные — ровно того же размера, чтобы при листании "
+    "кадр не прыгал. Включается вместе с любым оформлением.\n\n"
     "Слова заголовка, выделенные <i>курсивом</i> или <u>подчёркиванием</u>, будут красными. "
     "Без выделения красным станет конец заголовка. В анонсе и цитате хвост "
     "<code>— Имя</code> уйдёт в подпись под заголовком (артист / автор).\n\n"
@@ -118,7 +121,7 @@ class App:
 
 
 class PostCB(CallbackData, prefix="post"):
-    action: str  # publish | schedule | discard | unschedule | now | quick | mode
+    action: str  # publish | schedule | discard | unschedule | now | quick | mode | carousel
     id: int
     arg: str = ""
 
@@ -211,10 +214,11 @@ def quick_time(code: str, now: datetime) -> datetime:
 
 # ---------- клавиатуры ----------
 
-def draft_kb(post_id: int, mode: str | None = None) -> InlineKeyboardMarkup:
-    """Кнопки черновика; mode — текущее оформление (None у постов до режимов — без переключателя)."""
+def draft_kb(post_id: int, style: dict | None = None) -> InlineKeyboardMarkup:
+    """Кнопки черновика; style — текущее оформление (None у постов до режимов — без переключателей)."""
     modes = []
-    if mode:
+    if style:
+        mode = style["mode"]
         buttons = [
             InlineKeyboardButton(
                 text=("✓ " if key == mode else "") + label,
@@ -223,6 +227,12 @@ def draft_kb(post_id: int, mode: str | None = None) -> InlineKeyboardMarkup:
             for key, label in MODES.items()
         ]
         modes = [buttons[:3], buttons[3:]]
+        if len(style["sources"]) > 1:
+            on = style.get("carousel", False)
+            modes.append([InlineKeyboardButton(
+                text=("✓ " if on else "") + CAROUSEL_LABEL,
+                callback_data=PostCB(action="carousel", id=post_id).pack(),
+            )])
     return InlineKeyboardMarkup(inline_keyboard=[
         *modes,
         [
@@ -508,6 +518,7 @@ async def process_chat(app: App, messages: list[Message]) -> None:
 # ---------- посты ----------
 
 DEFAULT_MODE = "news"
+CAROUSEL_LABEL = "🎠 Карусель"
 
 _albums: dict[str, list[Message]] = {}
 _album_tasks: dict[str, asyncio.Task] = {}
@@ -579,11 +590,13 @@ def _announce_cover(sources: list[dict]) -> dict | None:
     return sources[1] if len(sources) > 1 and sources[1]["kind"] == "photo" else None
 
 
-async def render_media(app: App, chat_id: int, sources: list[dict], mode: str, card: Card) -> list[dict]:
+async def render_media(app: App, chat_id: int, sources: list[dict], mode: str, card: Card,
+                       carousel: bool = False) -> list[dict]:
     """Оформляет исходники для send_media.
 
     Первый файл — карточка шаблона, остальные — без оверлея. В релизах первые фото
     (до трёх) склеиваются в одну карточку с обложками, в анонсе второе фото — обложка в карточке.
+    В карусели слайды без оверлея — ровно размера первого, чтобы при листании кадр не прыгал.
     """
     async def download(file_id: str) -> bytes:
         return (await app.bot.download(file_id)).read()
@@ -593,6 +606,15 @@ async def render_media(app: App, chat_id: int, sources: list[dict], mode: str, c
 
     def add_photo(image: bytes) -> None:
         items.append({"type": "photo", "file": BufferedInputFile(image, f"{len(items)}.jpg")})
+
+    def slide_size() -> tuple[int, int] | None:
+        """Размер слайда без оверлея: в карусели — как у первого, иначе — по кадру."""
+        if not carousel or not items:
+            return None
+        first = items[0]
+        if first["type"] == "video":
+            return first["width"], first["height"]
+        return image_size(first["file"].data)
 
     async with app.render_lock:
         await app.bot.send_chat_action(chat_id, "upload_video" if has_video else "upload_photo")
@@ -618,9 +640,12 @@ async def render_media(app: App, chat_id: int, sources: list[dict], mode: str, c
                     photos = [data] + ([cover] if cover else [])
                     add_photo(await asyncio.to_thread(render_card, mode, card, photos))
                 else:
-                    add_photo(await asyncio.to_thread(render_plain, data))
+                    add_photo(await asyncio.to_thread(render_plain, data, slide_size()))
             else:
-                video = await render_video(data, partial(card_layout, mode, card, cover=cover) if templated else None)
+                video = await render_video(
+                    data, partial(card_layout, mode, card, cover=cover) if templated else None,
+                    None if templated else slide_size(),
+                )
                 items.append({
                     "type": "video", "file": BufferedInputFile(video.data, f"{len(items)}.mp4"),
                     "width": video.width, "height": video.height, "duration": video.duration,
@@ -629,7 +654,7 @@ async def render_media(app: App, chat_id: int, sources: list[dict], mode: str, c
 
 
 async def make_preview(app: App, chat_id: int, sources: list[dict], mode: str, title: str,
-                       accent: list, caption: str, split: bool) -> list[dict] | None:
+                       accent: list, caption: str, split: bool, carousel: bool = False) -> list[dict] | None:
     """Оформляет пост, присылает превью и возвращает медиа для черновика.
 
     None — не получилось; причину уже написали в чат.
@@ -641,7 +666,7 @@ async def make_preview(app: App, chat_id: int, sources: list[dict], mode: str, t
             chat_id, "⏳ Оформляю…" + (" Видео обрабатывается дольше фото." if has_video else "")
         )
     try:
-        rendered = await render_media(app, chat_id, sources, mode, make_card(title, accent, mode))
+        rendered = await render_media(app, chat_id, sources, mode, make_card(title, accent, mode), carousel)
     except (PostError, VideoError) as e:
         await app.bot.send_message(chat_id, f"⚠️ {html.escape(str(e))}")
         return None
@@ -653,14 +678,15 @@ async def make_preview(app: App, chat_id: int, sources: list[dict], mode: str, t
     if split:
         await app.bot.send_message(chat_id, caption, link_preview_options=NO_PREVIEW)
     media = [_stored(m, item) for m, item in zip(sent, rendered)]
-    media[0]["style"] = {"mode": mode, "accent": accent, "sources": sources}
+    media[0]["style"] = {"mode": mode, "accent": accent, "sources": sources, "carousel": carousel}
     return media
 
 
-def draft_text(post_id: int, mode: str | None, split: bool, extra: str = "") -> str:
+def draft_text(post_id: int, style: dict | None, split: bool, extra: str = "") -> str:
     head = f"👆 Превью поста #{post_id}"
-    if mode:
-        head += f" — {MODES[mode]}{extra}. Другое оформление — кнопками ниже"
+    if style:
+        carousel = ", карусель" if style.get("carousel") else ""
+        head += f" — {MODES[style['mode']]}{carousel}{extra}. Другое оформление — кнопками ниже"
     text = head + ". Что делаем?"
     if split:
         text += ("\n\n⚠️ Текст длиннее 1024 символов — в подпись не влезет, "
@@ -699,7 +725,8 @@ async def process_post(app: App, messages: list[Message]) -> None:
     if media is None:
         return
     post_id = app.db.add_draft(media, caption, split, parsed.title)
-    await first.answer(draft_text(post_id, mode, split), reply_markup=draft_kb(post_id, mode))
+    style = media[0]["style"]
+    await first.answer(draft_text(post_id, style, split), reply_markup=draft_kb(post_id, style))
 
 
 @admin.callback_query(PostCB.filter(F.action == "mode"))
@@ -719,18 +746,40 @@ async def cb_mode(query: CallbackQuery, callback_data: PostCB, app: App) -> None
     await query.answer()
     # убираем кнопки, чтобы не нажать дважды, пока рендерится
     await query.message.edit_text(f"⏳ Пост #{post.id}: меняю оформление на {MODES[mode]}…")
+    await _restyle(query, app, post, style, dict(style, mode=mode), f"оформление сменилось на {MODES[mode]}")
 
+
+@admin.callback_query(PostCB.filter(F.action == "carousel"))
+async def cb_carousel(query: CallbackQuery, callback_data: PostCB, app: App) -> None:
+    post = app.db.get_post(callback_data.id)
+    if not post or post.status != "draft":
+        await query.answer("Этот пост уже обработан.", show_alert=True)
+        return
+    style = post_style(post)
+    if not style or len(style["sources"]) < 2:
+        await query.answer("Карусель — для альбома из нескольких файлов.", show_alert=True)
+        return
+    on = not style.get("carousel", False)
+    await query.answer()
+    await query.message.edit_text(f"⏳ Пост #{post.id}: {'собираю карусель' if on else 'убираю карусель'}…")
+    await _restyle(query, app, post, style, dict(style, carousel=on),
+                   "карусель включена" if on else "карусель выключена")
+
+
+async def _restyle(query: CallbackQuery, app: App, post: Post, old: dict, new: dict, done: str) -> None:
+    """Перерисовывает черновик в новом оформлении и присылает новое превью с кнопками."""
     media = await make_preview(
-        app, query.message.chat.id, style["sources"], mode, post.title, style["accent"],
-        post.caption_html, post.split_text,
+        app, query.message.chat.id, new["sources"], new["mode"], post.title, new["accent"],
+        post.caption_html, post.split_text, new.get("carousel", False),
     )
     if media is None:
-        await query.message.edit_text(draft_text(post.id, style["mode"], post.split_text),
-                                      reply_markup=draft_kb(post.id, style["mode"]))
+        await query.message.edit_text(draft_text(post.id, old, post.split_text),
+                                      reply_markup=draft_kb(post.id, old))
         return
     app.db.update_media(post.id, media)
-    await query.message.edit_text(f"Пост #{post.id}: оформление сменилось на {MODES[mode]}, новое превью ниже.")
-    await query.message.answer(draft_text(post.id, mode, post.split_text), reply_markup=draft_kb(post.id, mode))
+    style = media[0]["style"]
+    await query.message.edit_text(f"Пост #{post.id}: {done}, новое превью ниже.")
+    await query.message.answer(draft_text(post.id, style, post.split_text), reply_markup=draft_kb(post.id, style))
 
 
 @admin.message(AUDIO)
@@ -826,11 +875,10 @@ async def on_timecode(message: Message, app: App, state: FSMContext) -> None:
     if style:
         first["style"] = style
     app.db.update_media(post.id, [first] + post.media[1:])
-    mode = style["mode"] if style else None
     await message.answer(
-        draft_text(post.id, mode, post.split_text, extra=" с музыкой")
+        draft_text(post.id, style, post.split_text, extra=" с музыкой")
         + "\n\nДругой отрывок — пришли трек ещё раз. Смена оформления уберёт музыку.",
-        reply_markup=draft_kb(post.id, mode),
+        reply_markup=draft_kb(post.id, style),
     )
 
 
@@ -917,9 +965,8 @@ async def cb_unschedule(query: CallbackQuery, callback_data: PostCB, app: App) -
         return
     app.db.set_status(post.id, "draft")
     await query.answer("Снят с публикации")
-    style = post_style(post)
     await _replace_text(query, f"Пост #{post.id} снят с публикации — снова черновик.",
-                        draft_kb(post.id, style["mode"] if style else None))
+                        draft_kb(post.id, post_style(post)))
 
 
 @admin.callback_query(PostCB.filter(F.action == "discard"))

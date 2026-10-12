@@ -76,10 +76,12 @@ async def _probe(path: Path) -> tuple[int, int, float, bool]:
     return w, h, duration, has_audio
 
 
-async def render_video(src: bytes, make_layout: Callable[[tuple[int, int]], Layout] | None) -> VideoResult:
+async def render_video(src: bytes, make_layout: Callable[[tuple[int, int]], Layout] | None,
+                       size: tuple[int, int] | None = None) -> VideoResult:
     """Видео в шаблоне: кадр встаёт в окно layout.rect, сверху — слой шаблона.
     make_layout строит слой по размеру кадра; None — без оформления: кадр целиком
-    (слишком высокий или широкий — с размытыми полями) и перекодирование."""
+    (слишком высокий или широкий — с размытыми полями) и перекодирование.
+    size — точный размер видео без оформления (слайд карусели); по умолчанию — по кадру."""
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         src_path, overlay_path, out_path = tmp / "src", tmp / "overlay.png", tmp / "out.mp4"
@@ -91,7 +93,7 @@ async def render_video(src: bytes, make_layout: Callable[[tuple[int, int]], Layo
             (cw, ch), (x, y, rw, rh) = layout.size, layout.rect
             overlay_path.write_bytes(await asyncio.to_thread(layout_png, layout))
         else:
-            cw, ch = canvas_size(w, h)
+            cw, ch = size or canvas_size(w, h)
             x, y, rw, rh = 0, 0, cw, ch
 
         budget = MAX_OUTPUT_BYTES * 8 / max(duration, 1) - AUDIO_BITRATE
