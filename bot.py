@@ -24,6 +24,8 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InputMediaPhoto,
     InputMediaVideo,
+    InputRichMessage,
+    InputRichMessageMedia,
     LinkPreviewOptions,
     Message,
     MessageOriginChannel,
@@ -63,9 +65,9 @@ HELP = (
     "• 💬 <b>Цитата</b> — затемнённое чёрно-белое фото и текст в «ёлочках» "
     "(включается само, если первая строка в кавычках или оформлена цитатой);\n"
     "• 🖼 <b>Без оверлея</b> — только обрезка под формат.\n\n"
-    "<b>Карусель</b> — для альбома из нескольких файлов: кнопка 🎠 под превью. Оверлей будет "
-    "только на первом слайде, а все остальные — ровно того же размера, чтобы при листании "
-    "кадр не прыгал. Включается вместе с любым оформлением.\n\n"
+    "<b>Карусель</b> — для альбома из нескольких файлов: кнопка 🎠 под превью. Пост уйдёт "
+    "статьёй Telegram: слайды листаются свайпом прямо в ленте, текст — под ними. Оверлей только "
+    "на первом слайде, остальные — ровно того же размера. Включается вместе с любым оформлением.\n\n"
     "Слова заголовка, выделенные <i>курсивом</i> или <u>подчёркиванием</u>, будут красными. "
     "Без выделения красным станет конец заголовка. В анонсе и цитате хвост "
     "<code>— Имя</code> уйдёт в подпись под заголовком (артист / автор).\n\n"
@@ -262,10 +264,13 @@ def scheduled_kb(post_id: int) -> InlineKeyboardMarkup:
 
 # ---------- публикация ----------
 
+def _video_kwargs(item: dict) -> dict:
+    return {k: item[k] for k in ("width", "height", "duration") if item.get(k)}
+
+
 async def send_media(bot: Bot, chat_id: int | str, items: list[dict], caption: str | None) -> list[Message]:
     """Отправляет одно медиа или альбом. item: type, file (file_id или InputFile), для видео — размеры."""
-    def video_kwargs(item: dict) -> dict:
-        return {k: item[k] for k in ("width", "height", "duration") if item.get(k)}
+    video_kwargs = _video_kwargs
 
     if len(items) == 1:
         item = items[0]
@@ -285,16 +290,71 @@ async def send_media(bot: Bot, chat_id: int | str, items: list[dict], caption: s
     return await bot.send_media_group(chat_id, group)
 
 
+_RICH_BLOCKS = re.compile(r"(<blockquote[^>]*>.*?</blockquote>|<pre>.*?</pre>)", re.S)
+
+
+def rich_text(caption: str) -> str:
+    """Подпись в разметке Telegram → HTML статьи: цитаты и код — отдельными блоками,
+    остальное — абзацами, переносы строк — <br>."""
+    out = []
+    for i, part in enumerate(_RICH_BLOCKS.split(caption)):
+        if i % 2:  # цитата или код
+            out.append(part if part.startswith("<pre>") else part.replace("\n", "<br>"))
+        elif part := part.strip("\n"):
+            out.append("<p>" + part.replace("\n", "<br>") + "</p>")
+    return "".join(out)
+
+
+async def send_carousel(bot: Bot, chat_id: int | str, items: list[dict], caption: str) -> Message:
+    """Статья Telegram: слайды листаются свайпом прямо в ленте, под ними — текст поста."""
+    media, slides = [], []
+    for i, item in enumerate(items):
+        if item["type"] == "video":
+            media.append(InputRichMessageMedia(id=f"m{i}", media=InputMediaVideo(
+                media=item["file"], supports_streaming=True, **_video_kwargs(item))))
+            slides.append(f'<video src="tg://video?id=m{i}"></video>')
+        else:
+            media.append(InputRichMessageMedia(id=f"m{i}", media=InputMediaPhoto(media=item["file"])))
+            slides.append(f'<img src="tg://photo?id=m{i}"/>')
+    html_ = f"<tg-slideshow>{''.join(slides)}</tg-slideshow>{rich_text(caption)}"
+    return await bot.send_rich_message(chat_id, InputRichMessage(html=html_, media=media))
+
+
+def _stored(sent, item: dict) -> dict:
+    """Что сохранить о медиа из превью, чтобы потом опубликовать его без повторной загрузки.
+
+    sent — отправленное сообщение или слайд статьи: у обоих есть photo/video.
+    """
+    if item["type"] == "video":
+        return {"type": "video", "file_id": sent.video.file_id,
+                **{k: item[k] for k in ("width", "height", "duration")}}
+    return {"type": "photo", "file_id": sent.photo[-1].file_id}
+
+
+async def send_post(bot: Bot, chat_id: int | str, items: list[dict], caption: str, split: bool,
+                    carousel: bool = False) -> tuple[int, list[dict]]:
+    """Отправляет пост: альбом с подписью (длинный текст — следом отдельным сообщением)
+    или статью-карусель. Возвращает id первого сообщения и медиа для повторной отправки."""
+    if carousel:
+        sent = await send_carousel(bot, chat_id, items, caption)
+        show = next(b for b in sent.rich_message.blocks if b.type == "slideshow")
+        return sent.message_id, [_stored(b, item) for b, item in zip(show.blocks, items)]
+    album = await send_media(bot, chat_id, items, None if split else caption)
+    if split:
+        await bot.send_message(chat_id, caption, link_preview_options=NO_PREVIEW)
+    return album[0].message_id, [_stored(m, item) for m, item in zip(album, items)]
+
+
 async def publish(app: App, post: Post) -> str:
     """Отправляет пост в канал, возвращает ссылку на него (или название канала)."""
     target = app.channel_id or app.cfg.channel
     items = [dict(m, file=m["file_id"]) for m in post.media]
-    sent = await send_media(app.bot, target, items, None if post.split_text else post.caption_html)
-    if post.split_text:
-        await app.bot.send_message(target, post.caption_html, link_preview_options=NO_PREVIEW)
+    style = post_style(post)
+    message_id, _ = await send_post(app.bot, target, items, post.caption_html, post.split_text,
+                                    bool(style and style.get("carousel")))
     app.db.set_status(post.id, "published")
     if app.channel_username:
-        return f"https://t.me/{app.channel_username}/{sent[0].message_id}"
+        return f"https://t.me/{app.channel_username}/{message_id}"
     return app.cfg.channel
 
 
@@ -565,14 +625,6 @@ def _source(message: Message) -> tuple[str, str, int]:
     return kind, doc.file_id, doc.file_size or 0
 
 
-def _stored(sent: Message, item: dict) -> dict:
-    """Что сохранить о медиа из превью, чтобы потом опубликовать его без повторной загрузки."""
-    if item["type"] == "video":
-        return {"type": "video", "file_id": sent.video.file_id,
-                **{k: item[k] for k in ("width", "height", "duration")}}
-    return {"type": "photo", "file_id": sent.photo[-1].file_id}
-
-
 def post_style(post: Post) -> dict | None:
     """Как оформлен черновик: режим, исходные файлы и выделение в заголовке.
 
@@ -674,10 +726,7 @@ async def make_preview(app: App, chat_id: int, sources: list[dict], mode: str, t
         if status:
             await status.delete()
 
-    sent = await send_media(app.bot, chat_id, rendered, None if split else caption)
-    if split:
-        await app.bot.send_message(chat_id, caption, link_preview_options=NO_PREVIEW)
-    media = [_stored(m, item) for m, item in zip(sent, rendered)]
+    _, media = await send_post(app.bot, chat_id, rendered, caption, split, carousel)
     media[0]["style"] = {"mode": mode, "accent": accent, "sources": sources, "carousel": carousel}
     return media
 
@@ -688,7 +737,7 @@ def draft_text(post_id: int, style: dict | None, split: bool, extra: str = "") -
         carousel = ", карусель" if style.get("carousel") else ""
         head += f" — {MODES[style['mode']]}{carousel}{extra}. Другое оформление — кнопками ниже"
     text = head + ". Что делаем?"
-    if split:
+    if split and not (style and style.get("carousel")):  # в статью влезает до 32768 символов
         text += ("\n\n⚠️ Текст длиннее 1024 символов — в подпись не влезет, "
                  "поэтому опубликую его отдельным сообщением сразу под постом.")
     return text
@@ -865,13 +914,10 @@ async def on_timecode(message: Message, app: App, state: FSMContext) -> None:
         "width": video.width, "height": video.height, "duration": video.duration,
     }
     items = [new_first] + [dict(m, file=m["file_id"]) for m in post.media[1:]]
-    sent = await send_media(app.bot, message.chat.id, items, None if post.split_text else post.caption_html)
-    if post.split_text:
-        await message.answer(post.caption_html, link_preview_options=NO_PREVIEW)
-
-    first = {"type": "video", "file_id": sent[0].video.file_id,
-             "width": video.width, "height": video.height, "duration": video.duration}
     style = post_style(post)
+    _, media = await send_post(app.bot, message.chat.id, items, post.caption_html, post.split_text,
+                               bool(style and style.get("carousel")))
+    first = media[0]
     if style:
         first["style"] = style
     app.db.update_media(post.id, [first] + post.media[1:])
