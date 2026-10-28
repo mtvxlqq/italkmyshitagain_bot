@@ -634,6 +634,7 @@ class ChatMessage:
     time: str           # «21:04»
     text: str = ""
     note: str = ""      # «Фото», «Стикер» — вместо вложения, серым
+    avatar: bytes | None = None  # аватарка собеседника; нет — серый кружок
 
 
 ChatLine = tuple[str, tuple]  # строка и её цвет
@@ -740,6 +741,17 @@ def _circle(size: int, color: tuple) -> Image.Image:
     return img
 
 
+def _chat_avatar(data: bytes | None) -> Image.Image:
+    if data:
+        try:
+            face = ImageOps.fit(Image.open(io.BytesIO(data)).convert("RGBA"), (AVATAR_SIZE,) * 2, Image.LANCZOS)
+            face.putalpha(_circle(AVATAR_SIZE, WHITE).getchannel("A"))
+            return face
+        except OSError:
+            pass
+    return _circle(AVATAR_SIZE, AVATAR_STUB)
+
+
 def _draw_bubble(img: Image.Image, b: _Bubble, y: int) -> None:
     text_font = _font(CHAT_FONT, 29)
     name_font = _font(CHAT_NAME_FONT, 21)
@@ -756,7 +768,7 @@ def _draw_bubble(img: Image.Image, b: _Bubble, y: int) -> None:
                                     .round().astype(np.uint8)))
     img.alpha_composite(bubble, (BUBBLE_X, y))
     if b.avatar:
-        img.alpha_composite(_circle(AVATAR_SIZE, AVATAR_STUB), (AVATAR_X, y + h - AVATAR_SIZE))
+        img.alpha_composite(_chat_avatar(b.msg.avatar), (AVATAR_X, y + h - AVATAR_SIZE))
 
     x = BUBBLE_X + BUBBLE_PAD
     if b.name:

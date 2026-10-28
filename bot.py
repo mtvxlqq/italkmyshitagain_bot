@@ -536,19 +536,44 @@ def _sender(message: Message) -> tuple[str, str]:
     return "", "unknown"
 
 
-def _chat_message(app: App, message: Message) -> ChatMessage:
+async def _avatar(app: App, message: Message) -> bytes | None:
+    """Аватарка автора пересланного; нет её или скрыта настройками приватности — None."""
+    origin = message.forward_origin
+    try:
+        if isinstance(origin, MessageOriginUser):
+            photos = await app.bot.get_user_profile_photos(origin.sender_user.id, limit=1)
+            file_id = photos.photos[0][0].file_id if photos.photos else None
+        elif isinstance(origin, (MessageOriginChat, MessageOriginChannel)):
+            chat = origin.sender_chat if isinstance(origin, MessageOriginChat) else origin.chat
+            info = await app.bot.get_chat(chat.id)
+            file_id = info.photo.small_file_id if info.photo else None
+        else:
+            return None
+        return (await app.bot.download(file_id)).read() if file_id else None
+    except Exception:
+        log.warning("Не получилось взять аватарку", exc_info=True)
+        return None
+
+
+def _chat_message(app: App, message: Message, avatar: bytes | None = None) -> ChatMessage:
     name, key = _sender(message)
     note = next((label for attr, label in _ATTACHMENTS if getattr(message, attr, None)), "")
     return ChatMessage(
         sender=name, key=key,
         time=message.forward_origin.date.astimezone(app.cfg.tz).strftime("%H:%M"),
-        text=message.text or message.caption or "", note=note,
+        text=message.text or message.caption or "", note=note, avatar=avatar,
     )
 
 
 async def process_chat(app: App, messages: list[Message]) -> None:
     first = messages[0]
-    chat = [_chat_message(app, m) for m in messages]
+    avatars: dict[str, bytes | None] = {}
+    chat = []
+    for m in messages:
+        key = _sender(m)[1]
+        if key not in avatars:
+            avatars[key] = await _avatar(app, m)
+        chat.append(_chat_message(app, m, avatars[key]))
     status = await first.answer("⏳ Оформляю переписку…") if len(messages) > 5 else None
     try:
         pages = await asyncio.to_thread(render_chat, chat)
