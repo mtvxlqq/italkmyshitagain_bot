@@ -49,18 +49,34 @@ class Post:
     title: str
     status: str
     publish_at: datetime | None
+    # как оформлен черновик: {"mode", "accent", "sources", "carousel"};
+    # None — пост сделан до появления режимов, перерисовать его нельзя
+    style: dict | None = None
+
+    @property
+    def carousel(self) -> bool:
+        return bool(self.style and self.style.get("carousel"))
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Post":
+        media = json.loads(row["media"]) if row["media"] else [{"type": "photo", "file_id": row["photo_file_id"]}]
         return cls(
             id=row["id"],
-            media=json.loads(row["media"]) if row["media"] else [{"type": "photo", "file_id": row["photo_file_id"]}],
+            media=media,
             caption_html=row["caption_html"],
             split_text=bool(row["split_text"]),
             title=row["title"],
             status=row["status"],
             publish_at=datetime.fromisoformat(row["publish_at"]) if row["publish_at"] else None,
+            style=media[0].pop("style", None),
         )
+
+
+def _media_json(media: list[dict], style: dict | None) -> str:
+    """Оформление хранится в первом медиа — так база осталась прежней."""
+    if style:
+        media = [dict(media[0], style=style), *media[1:]]
+    return json.dumps(media)
 
 
 class Database:
@@ -76,11 +92,13 @@ class Database:
 
     # --- посты ---
 
-    def add_draft(self, media: list[dict], caption_html: str, split_text: bool, title: str) -> int:
+    def add_draft(self, media: list[dict], caption_html: str, split_text: bool, title: str,
+                  style: dict | None = None) -> int:
         cur = self.conn.execute(
             "INSERT INTO posts (photo_file_id, media, caption_html, split_text, title, created_at)"
             " VALUES (?, ?, ?, ?, ?, ?)",
-            (media[0]["file_id"], json.dumps(media), caption_html, int(split_text), title, utcnow().isoformat()),
+            (media[0]["file_id"], _media_json(media, style), caption_html, int(split_text), title,
+             utcnow().isoformat()),
         )
         self.conn.commit()
         return cur.lastrowid
@@ -93,10 +111,10 @@ class Database:
         row = self.conn.execute("SELECT * FROM posts WHERE status = 'draft' ORDER BY id DESC LIMIT 1").fetchone()
         return Post.from_row(row) if row else None
 
-    def update_media(self, post_id: int, media: list[dict]) -> None:
+    def update_media(self, post_id: int, media: list[dict], style: dict | None = None) -> None:
         self.conn.execute(
             "UPDATE posts SET media = ?, photo_file_id = ? WHERE id = ?",
-            (json.dumps(media), media[0]["file_id"], post_id),
+            (_media_json(media, style), media[0]["file_id"], post_id),
         )
         self.conn.commit()
 
