@@ -18,6 +18,12 @@ UPLOAD_LIMIT = 50 * 1024 * 1024  # больше бот отправить не �
 # итоговое видео целимся уложить сюда — запас на контейнер
 MAX_OUTPUT_BYTES = 48 * 1024 * 1024
 MAX_VIDEO_BITRATE = 6_000_000
+# потолок битрейта — от исходника с небольшим запасом на оверлей и потери перекодирования:
+# сжимать заново тот же кадр щедрее, чем сжат исходник, — только раздувать файл
+SOURCE_BITRATE_HEADROOM = 1.25
+MIN_VIDEO_BITRATE = 1_000_000
+# у libx264 — постоянное качество; простая сцена занимает меньше потолка
+X264_CRF = "23"
 AUDIO_BITRATE = 128_000
 # На хостинге мало памяти, а в контейнере ffmpeg видит все ядра хоста и заводит
 # буферы кадров на каждый поток — без ограничения его убивает OOM
@@ -57,6 +63,16 @@ async def _encoder_args(*x264_tune: str) -> list[str]:
     return args
 
 
+async def _rate_args(bitrate: int) -> list[str]:
+    """Кодер с ограничением битрейта: у libx264 — CRF с потолком, у остальных — средний битрейт."""
+    args = await _encoder_args()
+    if args[1] == "libx264":
+        args += ["-crf", X264_CRF]
+    else:
+        args += ["-b:v", str(bitrate)]
+    return args + ["-maxrate", str(bitrate), "-bufsize", str(bitrate * 2)]
+
+
 async def _run(*args: str) -> str:
     proc = await asyncio.create_subprocess_exec(
         *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
@@ -76,8 +92,8 @@ async def _ffprobe(path: Path) -> dict:
     return json.loads(await _run("ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)))
 
 
-async def _probe(path: Path) -> tuple[int, int, float, bool]:
-    """Ширина и высота (с учётом поворота), длительность, есть ли звук."""
+async def _probe(path: Path) -> tuple[int, int, float, bool, int | None]:
+    """Ширина и высота (с учётом поворота), длительность, есть ли звук, битрейт видеодорожки."""
     info = await _ffprobe(path)
     video = next((s for s in info["streams"] if s["codec_type"] == "video"), None)
     if not video:
@@ -89,8 +105,12 @@ async def _probe(path: Path) -> tuple[int, int, float, bool]:
     if abs(rotation) % 180 == 90:
         w, h = h, w
     duration = float(info["format"].get("duration") or video.get("duration") or 0)
-    has_audio = any(s["codec_type"] == "audio" for s in info["streams"])
-    return w, h, duration, has_audio
+    audio = [s for s in info["streams"] if s["codec_type"] == "audio"]
+    bitrate = int(video.get("bit_rate") or 0)
+    if not bitrate and (total := int(info["format"].get("bit_rate") or 0)):
+        # у дорожки битрейт не указан — общий минус звук
+        bitrate = total - sum(int(s.get("bit_rate") or AUDIO_BITRATE) for s in audio)
+    return w, h, duration, bool(audio), bitrate if bitrate > 0 else None
 
 
 def _check_size(out: Path, error: str) -> None:
@@ -105,7 +125,7 @@ async def render_video(src: Path, out: Path, make_layout: Callable[[tuple[int, i
     (слишком высокий или широкий — с размытыми полями) и перекодирование.
     size — точный размер видео без оформления (слайд карусели); по умолчанию — по кадру.
     Результат пишется в out."""
-    w, h, duration, has_audio = await _probe(src)
+    w, h, duration, has_audio, src_bitrate = await _probe(src)
     layout = await asyncio.to_thread(make_layout, (w, h)) if make_layout else None
     if layout:
         (cw, ch), (x, y, rw, rh) = layout.size, layout.rect
@@ -117,6 +137,8 @@ async def render_video(src: Path, out: Path, make_layout: Callable[[tuple[int, i
     bitrate = int(min(MAX_VIDEO_BITRATE, budget))
     if bitrate < 300_000:
         raise VideoError("Видео слишком длинное: в 50 МБ его не уместить в нормальном качестве")
+    if src_bitrate:
+        bitrate = min(bitrate, max(int(src_bitrate * SOURCE_BITRATE_HEADROOM), MIN_VIDEO_BITRATE))
 
     if layout is None or layout.whole:
         # кадр целиком, поля — размытая и затемнённая копия (размываем уменьшенную — так дешевле)
@@ -143,8 +165,7 @@ async def render_video(src: Path, out: Path, make_layout: Callable[[tuple[int, i
         args = [
             "ffmpeg", "-y", "-v", "error", *inputs,
             "-filter_complex", filters, "-filter_complex_threads", "1", "-map", "[out]",
-            *await _encoder_args(),
-            "-b:v", str(bitrate), "-maxrate", str(bitrate), "-bufsize", str(bitrate * 2),
+            *await _rate_args(bitrate),
         ]
         if has_audio:
             args += ["-map", "0:a:0", "-c:a", "aac", "-b:a", str(AUDIO_BITRATE)]
